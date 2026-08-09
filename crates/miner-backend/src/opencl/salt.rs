@@ -303,7 +303,10 @@ fn run_device(
                     .set_arg(&round)
                     .set_global_work_offset(offset)
                     .set_global_work_size(this);
-                if local > 0 {
+                // A chunk the local size does not divide is rejected outright,
+                // so a --size or --work-max that is not a multiple of --work
+                // would abort the run instead of letting the driver choose.
+                if local > 0 && this % local == 0 {
                     exec.set_local_work_size(local);
                 }
                 exec.enqueue_nd_range(&queue)

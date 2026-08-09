@@ -311,6 +311,34 @@ mod opencl {
         exact_matches(b, 1 << 16);
     }
 
+    /// A round size that `--work` does not divide leaves a chunk no local size
+    /// fits. The launch has to fall back to a driver-chosen size instead of
+    /// failing the whole run with CL_INVALID_WORK_GROUP_SIZE.
+    #[test]
+    fn opencl_runs_a_round_the_work_size_does_not_divide() {
+        let Some(mut b) = backend() else { return };
+
+        let job = Job {
+            mode: ModeConfig::Salt(config(MineMode::Create2)),
+            score: ScoreSpec::zeros(),
+            keccak: KeccakVariant::Tuned,
+            tuning: Tuning {
+                round_size: (1 << 16) + 1,
+                work_size: 64,
+                no_cache: true,
+                ..Tuning::default()
+            },
+            duration: Some(Duration::from_secs(2)),
+            verify: true,
+            exact_score: None,
+        };
+
+        let collector = Collector::default();
+        let stop = || false;
+        b.run(&job, &mut &collector, &stop)
+            .expect("a round the work size does not divide must still run");
+    }
+
     /// The two Keccak variants are meant to be interchangeable, so they must
     /// find the same address for the same work item.
     #[test]
