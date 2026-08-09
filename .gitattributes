@@ -1,0 +1,10 @@
+# Every tracked file in this repository is text, so normalise line endings on
+# the way into the index and check LF out on every platform. Windows is a
+# supported build host (docs/build/windows.md), and without this the CRLF that
+# already reached kernels/ and three .rs files would come back the next time one
+# of them is edited there.
+#
+# The kernel sources matter more than the rest: they are embedded with
+# include_str! and hashed into the compiled-kernel cache key, so a line-ending
+# flip invalidates every cached binary on every machine.
+* text=auto eol=lf

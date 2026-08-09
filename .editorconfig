@@ -1,0 +1,31 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.rs]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+[*.{cl,metal}]
+indent_style = space
+indent_size = 4
+
+[*.{sh,bash}]
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,toml}]
+indent_style = space
+indent_size = 2
+
+# Paragraphs are one line each here, so an editor that rewraps at a column
+# would fight the convention. Two trailing spaces are a Markdown hard break,
+# which is why trimming is off as well.
+[*.md]
+max_line_length = off
+trim_trailing_whitespace = false

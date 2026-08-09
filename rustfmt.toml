@@ -1,0 +1,8 @@
+# Defaults everywhere else on purpose: a contributor's editor formats on save
+# with stock rustfmt, and a setting it does not know about turns their pull
+# request into someone else's churn.
+#
+# This one is not a style choice. Nine files arrived with CRLF while the rest of
+# the tree is LF, and rustfmt's default of "Auto" preserves whatever a file
+# already has, so the split would never close on its own.
+newline_style = "Unix"
