@@ -7,6 +7,10 @@
 //! yields the private key for the found address, and the miner never sees a
 //! private key at any point.
 //!
+//! Devices are partitioned inside that offset rather than left to chance: the
+//! top lane of `seed` carries a device slot above the bits the kernel adds `id`
+//! into, so two devices cannot walk the same sequence however they are drawn.
+//!
 //! Three large scratch buffers hold the batched-inversion state, sized
 //! `inverse_size * inverse_multiple` elements of 32 bytes each.
 
@@ -21,6 +25,7 @@ use opencl3::device::Device;
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
+use rand::RngCore;
 
 use super::{DeviceId, build_program, cl_err, enumerate_devices};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
@@ -119,36 +124,48 @@ fn be_bytes_to_ulong4(bytes: &[u8; 32]) -> ClUlong4 {
     ClUlong4(lanes)
 }
 
-/// A random starting offset. Only the top 16 bits are cleared, so adding this
-/// to the user's seed private key cannot overflow 256 bits. Cryptographic
-/// quality is not needed: the security of the result comes from the user's own
-/// seed key, this only keeps devices from covering the same ground.
-fn random_seed() -> ClUlong4 {
+/// The most significant lane of an offset is a packed field. From the top: 16
+/// bits left clear so `seed_priv + offset` cannot overflow 256 bits, 16 bits of
+/// device slot, and 32 bits the kernel adds the work-item id into.
+const ID_BITS: u32 = 32;
+const MAX_ROUND_SIZE: u64 = 1 << ID_BITS;
+const MAX_DEVICES: u64 = 1 << 16;
+
+/// One device's starting offset: 192 random bits, so two runs do not cover the
+/// same ground, above a device slot no other device of this run can reach.
+///
+/// Cryptographic quality is not needed — the security of the result comes from
+/// the user's own seed key, which never enters this process — but `rand::rng()`
+/// is per-thread and OS-seeded, unlike a clock read, and it is what the salt
+/// modes already use.
+fn device_seed(device_index: usize) -> ClUlong4 {
     let mut bytes = [0u8; 32];
-    getrandom(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut lanes = be_bytes_to_ulong4(&bytes);
-    lanes.0[3] &= 0x0000_ffff_ffff_ffff;
+    lanes.0[3] = (device_index as u64) << ID_BITS;
     lanes
 }
 
-fn getrandom(buf: &mut [u8; 32]) {
-    // Avoid a dependency here; the caller-visible randomness requirement is
-    // only that two devices do not repeat each other's work.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut state = (nanos as u64) ^ (std::process::id() as u64).rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15;
-    for chunk in buf.chunks_mut(8) {
-        // SplitMix64.
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        chunk.copy_from_slice(&z.to_be_bytes()[..chunk.len()]);
+/// Both fields have to hold for the separation to mean anything: a round wider
+/// than its id field would reach into the next device's slot, and a slot above
+/// its own field into the bits that must stay clear. Neither limit is anywhere
+/// near a tuning that fits in memory — the default round is 2²² work items —
+/// but checking them is what makes the separation structural rather than
+/// assumed.
+fn check_offset_fields(round_size: usize, infos: &[DeviceInfo]) -> Result<()> {
+    if round_size as u64 > MAX_ROUND_SIZE {
+        return Err(BackendError::Other(format!(
+            "--inverse-size x --inverse-multiple is {round_size} work items, \
+             above the {MAX_ROUND_SIZE} one round can address"
+        )));
     }
+    let highest = infos.iter().map(|i| i.index).max().unwrap_or(0) as u64;
+    if highest >= MAX_DEVICES {
+        return Err(BackendError::Other(format!(
+            "device index {highest} is above the {MAX_DEVICES} an offset can keep apart"
+        )));
+    }
+    Ok(())
 }
 
 /// `seed + round + (found_id << 192)` as a big-endian 32-byte scalar.
@@ -181,6 +198,8 @@ fn run_profanity(
     reporter: &mut dyn Reporter,
     should_stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
+    check_offset_fields(job.tuning.profanity_round_size(), infos)?;
+
     let source = program_source(job.keccak);
     let options = format!(
         "-D PROFANITY_INVERSE_SIZE={} -D PROFANITY_MAX_SCORE={MAX_SCORE}",
@@ -359,7 +378,7 @@ fn run_device(
     }
 
     let (seed_x_bytes, seed_y_bytes) = cfg.seed_public_key.to_bytes();
-    let seed = random_seed();
+    let seed = device_seed(info.index);
     let seed_x = be_bytes_to_ulong4(&seed_x_bytes);
     let seed_y = be_bytes_to_ulong4(&seed_y_bytes);
     let is_contract: cl_uchar = cfg.contract.into();
@@ -513,7 +532,13 @@ fn enqueue_chunked(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    fn info(index: usize) -> DeviceInfo {
+        DeviceInfo { index, name: String::new(), compute_units: 0, global_memory: 0 }
+    }
 
     #[test]
     fn offset_is_seed_plus_round_plus_shifted_id() {
@@ -543,9 +568,52 @@ mod tests {
 
     #[test]
     fn seed_clears_the_top_bits_so_a_sum_cannot_overflow() {
-        for _ in 0..16 {
-            assert_eq!(random_seed().0[3] >> 48, 0);
+        for device in [0, 1, 7, MAX_DEVICES as usize - 1] {
+            assert_eq!(device_seed(device).0[3] >> 48, 0);
         }
+    }
+
+    #[test]
+    fn seed_reserves_the_top_lane_for_the_device_slot() {
+        for device in [0, 1, 7, MAX_DEVICES as usize - 1] {
+            assert_eq!(device_seed(device).0[3], (device as u64) << ID_BITS);
+        }
+    }
+
+    /// The whole point of the packing: the widest permitted round on one device
+    /// stops short of the next device's slot, so no work item of one device can
+    /// land on an offset another device reaches.
+    #[test]
+    fn the_widest_round_stops_short_of_the_next_device_slot() {
+        // The largest id a permitted round produces, as the kernel reports it.
+        let widest = u32::try_from(MAX_ROUND_SIZE - 1).expect("a round must fit the uint foundId");
+        // Identical low lanes, as if the RNG had failed both devices, and the
+        // highest round against the lowest: only the top lane can separate them.
+        let shared = |device: u64| ClUlong4([9, 9, 9, device << ID_BITS]);
+
+        for device in 0..4 {
+            let last = offset_scalar(&shared(device), u64::MAX >> 1, widest);
+            let first_of_next = offset_scalar(&shared(device + 1), 0, 0);
+            assert!(last < first_of_next, "device {device} reaches into the next slot");
+        }
+    }
+
+    /// The predecessor derived all 256 bits from a clock read, so two device
+    /// threads starting together usually drew the same seed.
+    #[test]
+    fn the_random_part_of_a_seed_differs_every_draw() {
+        let drawn: HashSet<[u64; 4]> = (0..1000).map(|_| device_seed(0).0).collect();
+        assert_eq!(drawn.len(), 1000);
+    }
+
+    #[test]
+    fn a_round_or_a_rig_too_large_for_the_offset_fields_is_rejected() {
+        assert!(check_offset_fields(MAX_ROUND_SIZE as usize, &[info(0)]).is_ok());
+        assert!(check_offset_fields(MAX_ROUND_SIZE as usize + 1, &[info(0)]).is_err());
+
+        let highest = MAX_DEVICES as usize - 1;
+        assert!(check_offset_fields(1, &[info(0), info(highest)]).is_ok());
+        assert!(check_offset_fields(1, &[info(0), info(highest + 1)]).is_err());
     }
 
     #[test]

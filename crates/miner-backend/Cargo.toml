@@ -15,6 +15,7 @@ metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
 [dependencies]
 miner-core.workspace = true
 hex.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 opencl3 = { workspace = true, optional = true }
 

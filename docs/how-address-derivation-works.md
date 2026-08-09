@@ -79,4 +79,4 @@ offset = seed + r + (id << 192)
 
 and the miner prints that offset. Adding it to your seed private key modulo the curve order gives the private key for the found address. The miner only ever sees a public key.
 
-The top 16 bits of `seed` are cleared so that adding the offset to a seed private key cannot overflow 256 bits.
+`seed` is 192 random bits below a most significant lane set to `device_index << 32`. That reserves the 32 bits under the device's slot for `id`, so two GPUs in one run cannot produce the same offset however closely they start, and it leaves the top 16 bits clear so that adding the offset to a seed private key cannot overflow 256 bits.

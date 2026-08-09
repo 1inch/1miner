@@ -75,6 +75,7 @@ Import the resulting private key into a wallet and confirm it shows the address 
 ## Notes
 
 - The offset's top 16 bits are always zero, so adding it to a seed key cannot overflow 256 bits.
+- Each GPU gets its own slice of the offset space rather than a random starting point of its own, so no two devices in a run can cover the same ground.
 - Metal does not support this mode. It needs a secp256k1 kernel, and only the keccak-based salt modes have one. Use `--backend opencl`.
 - `--backend cpu` works and is useful for verification, but it performs a modular inversion per step and is orders of magnitude slower.
 - The kernel deliberately skips the equal-x edge cases in point addition, as the reference implementation does. Those cases are astronomically rare and cost only a missed candidate.

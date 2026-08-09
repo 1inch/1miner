@@ -292,6 +292,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "opencl3",
+ "rand",
  "thiserror",
 ]
 
