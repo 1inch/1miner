@@ -8,7 +8,7 @@ The deployer hands out vanity addresses as tokens: you search for an input that 
 
 The deployer is a CREATE3 factory, so an address depends on exactly two things: the deployer contract and a 32-byte salt. The init code of whatever you eventually deploy plays no part, which is why the address can be settled before that contract is even written. See [how-address-derivation-works.md](../how-address-derivation-works.md) for the derivation itself.
 
-What makes this mode different from plain [create3](create3.md) is that the deployer does not let you choose the whole salt. It builds the salt from two halves, in [AddressToken.sol](../../references/address-token/contracts/AddressToken.sol):
+What makes this mode different from plain [create3](create3.md) is that the deployer does not let you choose the whole salt. It builds the salt from two halves, in [AddressToken.sol](https://github.com/1inch/address-token/blob/master/contracts/AddressToken.sol):
 
 ```solidity
 function getTokenIdAndSalt(bytes16 magic, address account) public view returns(address tokenId, bytes32 salt) {
@@ -130,4 +130,4 @@ Both are silent because both produce perfectly well-formed addresses; they are s
 
 Use [create3](create3.md) if you control a CREATE3 factory of your own and want the full 32-byte salt, with no account binding and nothing to mint. That path gives a salt you pass straight to `deploy(salt, initCode)`. Use `1nft` when the address is to come from the 1inch Address NFT deployer, be owned as a transferable token, and be tradeable on the secondary market the collection has.
 
-The contract source is vendored at [references/address-token](../../references/address-token/contracts/AddressToken.sol) if you want to read the rest of it.
+The contract source is at [1inch/address-token](https://github.com/1inch/address-token/blob/master/contracts/AddressToken.sol) if you want to read the rest of it.

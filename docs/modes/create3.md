@@ -19,7 +19,7 @@ The cost is throughput: two keccaks per candidate instead of one, so roughly hal
 
 `--deployer` is the factory and is required. It is never assumed, because a salt mined against the wrong factory produces an address that looks entirely valid and is unusable.
 
-If you do not have a factory yet, the reference `Create3Deployer` is vendored at [references/create3-contract](../../references/create3-contract/contracts/Create3Deployer.sol) along with a deploy script. It exposes exactly two functions:
+If you do not have a factory yet, the reference [`Create3Deployer`](https://github.com/1inch/create3-contract/blob/main/contracts/Create3Deployer.sol) comes with a deploy script. It exposes exactly two functions:
 
 ```solidity
 function deploy(bytes32 salt, bytes calldata code) external onlyOwner returns (address);

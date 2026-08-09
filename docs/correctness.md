@@ -36,7 +36,7 @@ Worth running on a freshly rented box before committing it to a long job. It tak
 
 **Constant guards.** `keccak256(0x67363d3d37363d34f03d5260086018f3)` must equal the default proxy code hash, so a corrupted constant cannot pass silently.
 
-**The secp256k1 implementation** against the standard 2G and 3G vectors, the address of the generator, additive consistency between `a+b` and scalar multiplication, and the point at infinity. The generated 8160-entry precomputed table is compared entry by entry against profanity2's checked-in `precomp.cpp`, which pins the field arithmetic and the table index layout together.
+**The secp256k1 implementation** against the standard 2G and 3G vectors, the address of the generator, additive consistency between `a+b` and scalar multiplication, and the point at infinity. The generated 8160-entry precomputed table is compared entry by entry against profanity2's checked-in [`precomp.cpp`](https://github.com/1inch/profanity2/blob/master/src/precomp.cpp), which pins the field arithmetic and the table index layout together. That comparison reads the upstream tree from `references/`, which is gitignored, so it skips on a fresh clone and in every container build. A digest of the whole table is pinned beside it and runs everywhere; it catches a regression but cannot replace the cross-check, since it pins the table against itself rather than against profanity2.
 
 **Scoring parity.** Each of the eight scoring functions is a line-by-line port of its kernel counterpart, including the break-on-first-miss behaviour that separates `leading` from `range`, with tests covering the boundaries.
 

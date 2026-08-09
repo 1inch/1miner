@@ -11,6 +11,8 @@ kernels/
   metal/           salt.metal
 ```
 
+You may also find a `references/` directory holding checkouts of the upstream miners and contracts — profanity2, ERADICATE2/3, the AddressToken and Create3Deployer sources. It is gitignored and purely a local convenience for reading them side by side with this code. Nothing builds from it, and the only test that reads it says so and skips when it is absent.
+
 ## Two engine families
 
 The four modes split into two shapes, and the split runs deeper than the CLI suggests:
