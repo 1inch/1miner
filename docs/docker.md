@@ -105,8 +105,14 @@ Publishing keys on the version, so a release is a version bump and nothing else:
 cargo update --workspace
 cargo test
 git commit -am "1miner 0.1.1" && git push
+git tag -a v0.1.1 -m "1miner 0.1.1"
+git push origin v0.1.1
 ```
 
 `cargo update --workspace` is not optional. `Cargo.lock` records the versions of the workspace's own crates, and the Dockerfile builds with `--locked`, so a lock file left at the old version fails the image build with `cannot update the lock file ... because --locked was passed`.
 
-The workflow reads the version back out of the built binary's `--version`, asks GHCR whether that tag exists and pushes `0.1.1`, `0.1` and `latest` if it does not. A `v*` git tag is optional and grants nothing extra; one whose number disagrees with the binary fails the build rather than publishing an image whose name and contents differ. To republish a version after a change that does not touch the Rust code — the Dockerfile or the entrypoint — run the workflow by hand with `republish` set.
+The push to `main` is what publishes. The workflow reads the version back out of the built binary's `--version`, asks GHCR whether that tag exists and pushes `0.1.1`, `0.1` and `latest` if it does not.
+
+The `v0.1.1` tag anchors the release in git and gets a build of its own, which fails when the tag and the binary name different versions — a tag pointing at a commit that was never bumped is the mistake nothing else here would catch. That run publishes nothing, so it does not matter whether it lands before or after the one from `main`.
+
+To republish a version after a change that does not touch the Rust code — the Dockerfile or the entrypoint — run the workflow by hand with `republish` set.

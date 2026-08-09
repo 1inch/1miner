@@ -107,6 +107,15 @@ jobs:
           if [ "$REPUBLISH" = "true" ]; then
             publish=true
             reason="publishing $image:$VERSION again, as requested"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            # A tag pushed alongside its commit starts a second run of the same
+            # build, racing the one from the default branch. Whichever lost
+            # would find the version published and skip — and if the tag won,
+            # `latest` would stay on the previous release, because only a
+            # default-branch run carries that tag. Checking the tag against the
+            # version is what this run is for.
+            publish=false
+            reason="tag build: $VERSION is published by the push to the default branch, not from the tag"
           elif docker buildx imagetools inspect "$image:$VERSION" >/dev/null 2>&1; then
             publish=false
             reason="not published: $image:$VERSION already exists. Bump the workspace version in Cargo.toml to release."
