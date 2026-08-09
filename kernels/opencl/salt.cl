@@ -129,6 +129,13 @@ void salt_result_update(const uchar * const H, __global result * const pResult, 
 	}
 }
 
+/* Returning a constant 0 is safe here, and deliberately unlike profanity.cl's
+ * benchmark scorer, which has to consume the address bytes. This kernel picks
+ * its scorer with a runtime switch on a value read from pMode, so the compiler
+ * must keep every branch and the hash above stays live whatever this one does.
+ * profanity.cl selects at compile time through PROFANITY_SCORE_KERNEL, where a
+ * constant would let the keccak behind it be eliminated and the reported
+ * hashrate become fiction. Do not "fix" the asymmetry in either direction. */
 void salt_score_benchmark(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
 	salt_result_update(hash, pResult, 0, scoreMax, deviceIndex, round);
 }

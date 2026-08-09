@@ -184,6 +184,11 @@ static void apply_work_item(thread ulong* state, uint deviceIndex, uint gid, uin
 static int score_address(thread const uchar* hash, constant Mode& mode) {
     int score = 0;
     switch (mode.function) {
+    // A constant 0 is safe because this switch reads mode.function at run time,
+    // so every branch survives and the hash stays live. profanity.cl's
+    // benchmark scorer has to consume the address bytes instead: it is selected
+    // at compile time, where a constant would let its keccak be eliminated and
+    // the reported hashrate become fiction. The asymmetry is deliberate.
     case kBenchmark:
         return 0;
 
