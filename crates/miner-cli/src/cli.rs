@@ -171,12 +171,41 @@ pub struct ScoringArgs {
     #[arg(long)]
     pub range: bool,
 
-    /// Range minimum nibble, 0-15.
-    #[arg(long, short = 'm', default_value_t = 0)]
-    pub min: u8,
-    /// Range maximum nibble, 0-15.
-    #[arg(long, short = 'M', default_value_t = 15)]
-    pub max: u8,
+    // Deliberately Option rather than a defaulted u8: only --range and
+    // --leading-range read these, and a clap default would make "supplied"
+    // indistinguishable from "defaulted", which is how they came to be accepted
+    // and silently ignored beside every other scoring mode.
+    /// Range minimum nibble, 0-15. Defaults to 0.
+    #[arg(long, short = 'm')]
+    pub min: Option<u8>,
+    /// Range maximum nibble, 0-15. Defaults to 15.
+    #[arg(long, short = 'M')]
+    pub max: Option<u8>,
+}
+
+/// Highest `--inverse-size` accepted. `PROFANITY_INVERSE_SIZE` is the length of
+/// two private `mp_number` arrays in profanity.cl, 32 bytes each, so 1024 asks
+/// one work item for 64 KB of private memory — already past any real device.
+/// Above that the build spills or fails to compile with no useful diagnostic.
+const MAX_INVERSE_SIZE: usize = 1024;
+
+/// Zero reaches the backends as a division or an empty round: `--inverse-size 0`
+/// divides by zero at `size / job.tuning.inverse_size` in `run_profanity`, and
+/// `--size 0` leaves the salt loop with nothing to enqueue, so it spins at full
+/// speed reporting a rate of zero.
+fn positive(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".into()),
+        Ok(v) => Ok(v),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn inverse_size(s: &str) -> Result<usize, String> {
+    match positive(s)? {
+        v if v > MAX_INVERSE_SIZE => Err(format!("must be at most {MAX_INVERSE_SIZE}")),
+        v => Ok(v),
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -194,19 +223,19 @@ pub struct CommonArgs {
     pub work: usize,
 
     /// Largest single enqueue.
-    #[arg(long = "work-max", short = 'W')]
+    #[arg(long = "work-max", short = 'W', value_parser = positive)]
     pub work_max: Option<usize>,
 
     /// Salt candidates per round per device.
-    #[arg(long, short = 'S', default_value_t = 16_777_216)]
+    #[arg(long, short = 'S', default_value_t = 16_777_216, value_parser = positive)]
     pub size: usize,
 
     /// profanity batched-inverse width.
-    #[arg(long = "inverse-size", short = 'i', default_value_t = 255)]
+    #[arg(long = "inverse-size", short = 'i', default_value_t = 255, value_parser = inverse_size)]
     pub inverse_size: usize,
 
     /// profanity parallel inverse batches.
-    #[arg(long = "inverse-multiple", short = 'I', default_value_t = 16_384)]
+    #[arg(long = "inverse-multiple", short = 'I', default_value_t = 16_384, value_parser = positive)]
     pub inverse_multiple: usize,
 
     /// Skip the device at this index. Repeatable.
@@ -300,19 +329,38 @@ impl ScoringArgs {
         if let Some(p) = &self.exact {
             chosen.push(("--exact", ScoreSpec::matching(p)?));
         }
+        let min = self.min.unwrap_or(0);
+        let max = self.max.unwrap_or(15);
         if self.leading_range {
-            chosen.push((
-                "--leading-range",
-                ScoreSpec::leading_range(self.min, self.max)?,
-            ));
+            chosen.push(("--leading-range", ScoreSpec::leading_range(min, max)?));
         }
         if self.range {
-            chosen.push(("--range", ScoreSpec::range(self.min, self.max)?));
+            chosen.push(("--range", ScoreSpec::range(min, max)?));
         }
 
         match chosen.len() {
             1 => {
                 let (name, spec) = chosen.pop().expect("length checked");
+
+                // Checked here rather than before the count, so that a bound
+                // with no scoring mode at all still gets the more useful
+                // "choose a scoring mode" below.
+                if !(self.range || self.leading_range) {
+                    let bounds: Vec<&str> = [self.min.map(|_| "--min"), self.max.map(|_| "--max")]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    if !bounds.is_empty() {
+                        // Phrased without a pronoun so it reads for one bound
+                        // or both.
+                        anyhow::bail!(
+                            "{name} does not read {}; use --range or --leading-range to bound \
+                             the nibbles",
+                            bounds.join(" and ")
+                        );
+                    }
+                }
+
                 let exact_score = if name == "--exact" {
                     let needed = spec.constrained_bytes();
                     if needed == 0 {
@@ -415,6 +463,45 @@ mod tests {
     }
 
     #[test]
+    fn positive_rejects_zero_and_inverse_size_is_bounded() {
+        assert!(positive("0").is_err());
+        assert_eq!(positive("1").unwrap(), 1);
+        assert!(positive("-1").is_err());
+
+        assert!(inverse_size("0").is_err());
+        assert_eq!(inverse_size("1").unwrap(), 1);
+        assert_eq!(
+            inverse_size(&MAX_INVERSE_SIZE.to_string()).unwrap(),
+            MAX_INVERSE_SIZE
+        );
+        assert!(inverse_size(&(MAX_INVERSE_SIZE + 1).to_string()).is_err());
+    }
+
+    /// Wiring a parser onto three flags and forgetting the fourth is the way
+    /// this fix fails, so every flag is checked through clap rather than the
+    /// parsers being trusted on their own.
+    #[test]
+    fn degenerate_tuning_values_are_rejected_on_every_flag() {
+        let parse = |flag: &str, value: &str| {
+            Cli::try_parse_from(["1miner", "create3", "--zeros", flag, value])
+        };
+
+        for flag in [
+            "--size",
+            "--inverse-size",
+            "--inverse-multiple",
+            "--work-max",
+        ] {
+            assert!(parse(flag, "0").is_err(), "{flag} 0 should be rejected");
+            assert!(parse(flag, "1").is_ok(), "{flag} 1 should be accepted");
+        }
+
+        assert!(parse("--inverse-size", &(MAX_INVERSE_SIZE + 1).to_string()).is_err());
+        // 0 stays meaningful here: it lets the driver pick the local work size.
+        assert!(parse("--work", "0").is_ok());
+    }
+
+    #[test]
     fn scoring_requires_exactly_one_mode() {
         let none = ScoringArgs::default();
         assert!(none.resolve().is_err());
@@ -435,6 +522,58 @@ mod tests {
             err.contains("--zeros") && err.contains("--letters"),
             "{err}"
         );
+    }
+
+    /// A bound that does nothing used to be accepted in silence, which reads as
+    /// a narrower search than the one actually running.
+    #[test]
+    fn range_bounds_are_rejected_beside_a_mode_that_ignores_them() {
+        let ignored = ScoringArgs {
+            zeros: true,
+            min: Some(5),
+            ..Default::default()
+        };
+        let err = ignored.resolve().unwrap_err().to_string();
+        assert!(err.contains("--min") && err.contains("--zeros"), "{err}");
+
+        let both = ScoringArgs {
+            leading_doubles: true,
+            min: Some(3),
+            max: Some(9),
+            ..Default::default()
+        };
+        let err = both.resolve().unwrap_err().to_string();
+        assert!(err.contains("--min and --max"), "{err}");
+
+        // No scoring mode at all is the more useful complaint of the two.
+        let only_bounds = ScoringArgs {
+            max: Some(9),
+            ..Default::default()
+        };
+        assert!(
+            only_bounds
+                .resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("choose a scoring mode")
+        );
+
+        let bounded = ScoringArgs {
+            range: true,
+            min: Some(5),
+            max: Some(9),
+            ..Default::default()
+        };
+        let spec = bounded.resolve().unwrap().spec;
+        assert_eq!((spec.data1[0], spec.data2[0]), (5, 9));
+
+        // Omitted bounds still mean the whole nibble range.
+        let unbounded = ScoringArgs {
+            leading_range: true,
+            ..Default::default()
+        };
+        let spec = unbounded.resolve().unwrap().spec;
+        assert_eq!((spec.data1[0], spec.data2[0]), (0, 15));
     }
 
     #[test]

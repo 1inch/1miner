@@ -61,10 +61,12 @@ A new kernel that is fast and wrong is the failure this project is arranged to p
 | `-w`, `--work` | all GPU backends | Local work size / threadgroup width. `0` lets the driver choose. |
 | `-W`, `--work-max` | OpenCL | Largest single enqueue; rounds are split into chunks of this size. |
 | `-S`, `--size` | salt modes | Candidates per round per device. Default 16777216. |
-| `-i`, `--inverse-size` | profanity | Batched-inversion width. Default 255. |
+| `-i`, `--inverse-size` | profanity | Batched-inversion width. Default 255, maximum 1024. |
 | `-I`, `--inverse-multiple` | profanity | Parallel inverse batches. Default 16384. |
 | `-s`, `--skip` | OpenCL | Skip a device by index. Repeatable. |
 | `-n`, `--no-cache` | OpenCL | Ignore the compiled-kernel cache. |
 | `--threads` | cpu | Worker threads. Defaults to available parallelism. |
 
 For profanity, `--inverse-size` times `--inverse-multiple` is both the number of points per round and the driver of memory use: three scratch buffers of 32 bytes per point, so the default 4.2M points needs roughly 400 MB. Lower `-I` first if a device runs out of memory or takes too long to initialise.
+
+`--inverse-size` is capped at 1024 because it becomes the length of two private `mp_number` arrays in the kernel, 32 bytes each: 1024 already asks a single work item for 64 KB of private memory, and past that a build spills or fails with no diagnostic worth reading. None of these flags accepts `0` except `--work`, where it means "let the driver choose".
