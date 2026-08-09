@@ -317,11 +317,14 @@ fn run_device(
         counter.fetch_add(round_size as u64, Ordering::Relaxed);
 
         if let Some(hit) = take_best(&results, cfg, job, info, best_score) {
-            if !job.is_exact() {
-                local_best = hit.score as cl_uchar;
-            }
             hits.lock().unwrap().push(hit);
         }
+        // After take_best rather than before, because it stores when it
+        // reports: one load then raises this kernel's bar to the best any
+        // device has found, instead of leaving a device that is behind writing
+        // results the host reads and throws away. In --exact mode the shared
+        // value is pinned, so this is a no-op.
+        local_best = best_score.load(Ordering::Relaxed) as cl_uchar;
     }
 
     queue.finish().map_err(cl_err("finish failed"))?;
@@ -376,4 +379,96 @@ fn take_best(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use miner_core::{DEFAULT_PROXY_CODE_HASH, parse_address};
+
+    use super::*;
+    use crate::Tuning;
+
+    fn config() -> SaltConfig {
+        let deployer = parse_address("0x9fBB3DF7C40Da2e5A0dE984fFE2CCB7C47cd0ABf").unwrap();
+        SaltConfig::new(
+            MineMode::Create2,
+            deployer,
+            DEFAULT_PROXY_CODE_HASH,
+            [7u8; 32],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn job(cfg: &SaltConfig, exact_score: Option<u32>) -> Job {
+        Job {
+            mode: ModeConfig::Salt(cfg.clone()),
+            score: ScoreSpec::zeros(),
+            keccak: KeccakVariant::Tuned,
+            tuning: Tuning::default(),
+            duration: None,
+            verify: true,
+            exact_score,
+        }
+    }
+
+    /// One occupied slot, holding a salt and the address it really derives, so
+    /// the re-derivation `take_best` does has something true to agree with.
+    fn results(score: usize, cfg: &SaltConfig) -> Vec<ClResult> {
+        let salt = cfg.salt_at(0, 1, 1);
+        let mut slots = vec![ClResult::default(); MAX_SCORE + 1];
+        slots[score].salt = salt;
+        slots[score].hash = cfg.address_for_salt(&salt);
+        slots[score].found = 1;
+        slots
+    }
+
+    fn info() -> DeviceInfo {
+        DeviceInfo {
+            index: 0,
+            name: String::new(),
+            compute_units: 0,
+            global_memory: 0,
+        }
+    }
+
+    /// The round loop reloads its kernel's bar from the shared atomic, which
+    /// only carries every device's progress because reporting publishes there.
+    #[test]
+    fn a_reported_hit_raises_the_shared_bar() {
+        let cfg = config();
+        let shared = AtomicU64::new(0);
+
+        let hit = take_best(&results(9, &cfg), &cfg, &job(&cfg, None), &info(), &shared)
+            .expect("an occupied slot above the bar is a hit");
+        assert_eq!(hit.score, 9);
+        assert!(hit.verified);
+        assert_eq!(shared.load(Ordering::Relaxed), 9);
+    }
+
+    /// The M6 case: another device is already ahead, so this one reports
+    /// nothing and the bar it reloads afterwards is the leader's.
+    #[test]
+    fn a_beaten_hit_leaves_the_leader_in_the_shared_bar() {
+        let cfg = config();
+        let shared = AtomicU64::new(12);
+
+        assert!(take_best(&results(9, &cfg), &cfg, &job(&cfg, None), &info(), &shared).is_none());
+        assert_eq!(shared.load(Ordering::Relaxed), 12);
+    }
+
+    /// `--exact` pins the bar so repeat full matches keep reporting. The reload
+    /// has to be a no-op there, which holds only while nothing stores.
+    #[test]
+    fn exact_mode_never_moves_the_shared_bar() {
+        let cfg = config();
+        let job = job(&cfg, Some(4));
+        let pinned = job.initial_threshold() as u64;
+        let shared = AtomicU64::new(pinned);
+
+        let hit = take_best(&results(9, &cfg), &cfg, &job, &info(), &shared)
+            .expect("a full match still reports");
+        assert_eq!(hit.score, 9);
+        assert_eq!(shared.load(Ordering::Relaxed), pinned);
+    }
 }

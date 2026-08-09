@@ -513,6 +513,9 @@ fn run_device(
         counter.fetch_add(size as u64, Ordering::Relaxed);
 
         let threshold = best_score.load(Ordering::Relaxed);
+        // Every device's progress, not just this one's, so a device that is
+        // behind stops writing results the host reads and throws away.
+        local_best = threshold as cl_uchar;
         for score in (1..=MAX_SCORE).rev() {
             if results[score].found == 0 {
                 continue;
