@@ -363,7 +363,7 @@ fn ordinary_scoring_reports_only_improvements() {
 #[cfg(feature = "opencl")]
 mod opencl {
     use super::*;
-    use miner_backend::opencl::salt::SaltBackend;
+    use miner_backend::opencl::{profanity::ProfanityBackend, salt::SaltBackend};
 
     fn backend() -> Option<Box<dyn Backend>> {
         match SaltBackend::new(&[]) {
@@ -373,6 +373,112 @@ mod opencl {
                 None
             }
         }
+    }
+
+    fn profanity_backend() -> Option<ProfanityBackend> {
+        match ProfanityBackend::new(&[]) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping OpenCL profanity test: {e}");
+                None
+            }
+        }
+    }
+
+    /// A profanity job small enough to be a test. 255 x 64 is 16320 points
+    /// against the default 4.2M, so the three scratch buffers and the init
+    /// phase take a moment rather than 400 MB and several seconds.
+    fn small_profanity_job(cfg: ProfanityConfig, seconds: u64) -> Job {
+        Job {
+            tuning: Tuning {
+                inverse_size: 255,
+                inverse_multiple: 64,
+                work_size: 64,
+                no_cache: true,
+                ..Tuning::default()
+            },
+            ..profanity_job(cfg, ScoreSpec::zeros(), seconds)
+        }
+    }
+
+    /// The secp256k1 kernel — modular inversion, batched-inverse point
+    /// addition, and a documented set of deliberately unhandled edge cases — is
+    /// the most intricate code here and was the only kernel with no agreement
+    /// test. Until now its correctness rested on `--verify`, which fires on a
+    /// real hit and so tells an operator only after the fact.
+    ///
+    /// No target can be planted: unlike a salt work item, whose address
+    /// `salt_at` predicts before the run, a profanity work item's address is
+    /// not addressable in advance. So the assertion is the one that protects a
+    /// real run — every offset the kernel reports has to name the address the
+    /// kernel reported with it — made whenever the suite is run rather than
+    /// hours into someone's rental.
+    #[test]
+    fn opencl_profanity_offsets_name_the_addresses_reported() {
+        // --contract runs a second keccak over the account address, which is a
+        // separate path through the kernel and had no coverage either.
+        for contract in [false, true] {
+            let Some(mut b) = profanity_backend() else {
+                return;
+            };
+            let cfg = profanity_config(contract);
+            let job = small_profanity_job(cfg.clone(), 3);
+            let hits = run_until(&mut b, &job, u32::MAX);
+
+            assert!(
+                !hits.is_empty(),
+                "contract={contract}: no hits, so nothing here was checked"
+            );
+            for hit in &hits {
+                let offset = hit.offset.expect("a profanity hit carries an offset");
+                assert_eq!(
+                    cfg.address_for_offset(&offset),
+                    Some(hit.address),
+                    "contract={contract}: the offset names a different address"
+                );
+                assert!(hit.verified, "contract={contract}: hit reported unverified");
+            }
+        }
+    }
+
+    /// The strongest claim this path can make, and the one the salt modes
+    /// already enjoy: two implementations agreeing, rather than one checked
+    /// against itself.
+    ///
+    /// The kernel's field arithmetic is written in OpenCL C and shares no code
+    /// with the host's. Handing an offset it reported to the CPU walk as a
+    /// starting point makes the two derive an address for the same scalar by
+    /// entirely separate routes.
+    #[test]
+    fn the_kernel_and_the_cpu_walk_agree_on_one_offset() {
+        let Some(mut gpu) = profanity_backend() else {
+            return;
+        };
+        let cfg = profanity_config(false);
+        let hits = run_until(&mut gpu, &small_profanity_job(cfg.clone(), 10), 1);
+        let hit = hits.first().expect("the kernel reported no hits at all");
+        let offset = hit.offset.expect("a profanity hit carries an offset");
+
+        // Mask on the whole address the kernel claims for that offset. The CPU
+        // examines the offset it is started at first, so either its very first
+        // candidate is the answer or nothing later will be.
+        let score = ScoreSpec::matching(&hex::encode(hit.address)).unwrap();
+        let job = profanity_job(cfg, score, 10);
+        let walked = run_until(&mut CpuBackend::starting_at(Some(1), offset), &job, 20);
+
+        let found = walked
+            .first()
+            .expect("the CPU walk reported nothing at all for the kernel's offset");
+        assert_eq!(
+            found.offset,
+            Some(offset),
+            "the CPU walk did not start where it was told"
+        );
+        assert_eq!(
+            found.address, hit.address,
+            "the kernel and the CPU walk derived different addresses for one offset"
+        );
+        assert_eq!(found.score, 20);
     }
 
     #[test]

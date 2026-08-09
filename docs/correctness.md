@@ -24,7 +24,9 @@ Runs the checks against whatever device is actually present:
 1miner self-test --backend cpu
 ```
 
-Worth running on a freshly rented box before committing it to a long job. It takes under a second and catches a bad driver or a miscompiled kernel before the rental clock has cost you anything.
+All four modes are covered. The three salt modes get the planted target described below. profanity gets a short real search instead, in both plain and `--contract` shape, because a profanity work item's address cannot be predicted before the run the way a salt one can — so what is asserted is the property that protects a real run: every offset reported has to name the address reported with it. Metal prints those two as `skip`, having no secp256k1 kernel to test.
+
+Worth running on a freshly rented box before committing it to a long job. It takes a second or two and catches a bad driver or a miscompiled kernel before the rental clock has cost you anything.
 
 ## What the test suite covers
 
@@ -39,6 +41,8 @@ Worth running on a freshly rented box before committing it to a long job. It tak
 **Scoring parity.** Each of the eight scoring functions is a line-by-line port of its kernel counterpart, including the break-on-first-miss behaviour that separates `leading` from `range`, with tests covering the boundaries.
 
 **Cross-backend planted targets.** For each of create2, create3 and 1nft, a work item is chosen, its address computed on the CPU, and a full 20-byte mask built from it. The backend must find exactly that work item and report the matching salt. Passing exercises the pre-image construction, the keccak padding, the second CREATE hash, the scoring and the kernel's separate salt-reconstruction path all at once. Run against CPU, OpenCL and Metal.
+
+**The secp256k1 kernel.** No target can be planted for profanity, so it is checked the way `self-test` checks it: a short search on a small round, with every offset the kernel reports required to name the address reported with it, in both plain and `--contract` shape. Then one of those offsets is handed to the CPU walk as its starting point. The kernel's field arithmetic is OpenCL C and the host's is Rust, so that last step is two implementations agreeing on one scalar rather than one checked against itself — the claim the salt modes get from their planted targets.
 
 **Keccak variant equivalence.** Both permutations must find the same address for the same work item.
 

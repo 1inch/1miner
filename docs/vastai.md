@@ -27,7 +27,7 @@ The salt modes never involve a key at all. The worst a hostile host could do is 
 
 2. Pick an offer on the [search page](https://cloud.vast.ai/create/) and rent it. 1miner is pure compute, so sort by price.
 
-3. **Read the log before doing anything else.** `self-test` takes about a second and tells you whether the rental is sound:
+3. **Read the log before doing anything else.** `self-test` takes a second or two and tells you whether the rental is sound:
 
    ```
    Constants
@@ -40,6 +40,8 @@ The salt modes never involve a key at all. The worst a hostile host could do is 
      ok    create2 planted target
      ok    create3 planted target
      ok    1nft planted target
+     ok    profanity offset agreement
+     ok    profanity --contract offset agreement
 
    All checks passed.
    ```
