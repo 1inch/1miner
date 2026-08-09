@@ -45,7 +45,7 @@
 /* ------------------------------------------------------------------------ */
 #define MP_WORDS 8
 #define MP_BITS 32
-#define bswap32(n) (rotate(n & 0x00FF00FF, 24U)|(rotate(n, 8U) & 0x00FF00FF))
+#define bswap32(n) (rotate((n) & 0x00FF00FF, 24U)|(rotate((n), 8U) & 0x00FF00FF))
 
 typedef uint mp_word;
 typedef struct __attribute__((aligned(16))) {

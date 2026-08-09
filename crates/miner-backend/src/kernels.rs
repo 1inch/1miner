@@ -43,4 +43,19 @@ mod tests {
             assert!(!source.contains("uchar hasResult"));
         }
     }
+
+    /// `bswap32` uses its argument twice inside `&` expressions, so both uses
+    /// have to be bracketed. Every call site passes a plain array element
+    /// today, which is why an argument like `a | b` would go wrong quietly.
+    #[test]
+    fn the_byte_swap_macro_brackets_its_argument() {
+        let definition = PROFANITY
+            .lines()
+            .find(|line| line.starts_with("#define bswap32"))
+            .expect("profanity.cl defines bswap32");
+        assert!(
+            definition.contains("rotate((n) & ") && definition.contains("rotate((n), "),
+            "unbracketed macro argument: {definition}"
+        );
+    }
 }
