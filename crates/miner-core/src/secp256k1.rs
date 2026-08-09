@@ -309,7 +309,22 @@ pub fn parse_public_key(s: &str) -> Result<Point> {
 }
 
 /// `(a + b) mod n`, for combining a seed private key with a mined offset.
+///
+/// Both operands must be below `n`. `add_mod` subtracts one multiple of `n`, so
+/// that is exactly the range where a single conditional subtraction is enough;
+/// a larger operand comes back congruent but unreduced, which is a valid scalar
+/// modulo `n` and not the canonical one. Every caller is inside the range: a
+/// mined offset is masked below 2²⁴⁰ and a seed private key is a valid scalar
+/// by definition.
 pub fn add_scalars_mod_n(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    debug_assert!(
+        !cmp_ge(&fe_from_be_bytes(a), &N),
+        "operand must be below the group order"
+    );
+    debug_assert!(
+        !cmp_ge(&fe_from_be_bytes(b), &N),
+        "operand must be below the group order"
+    );
     let sum = add_mod(&fe_from_be_bytes(a), &fe_from_be_bytes(b), &N);
     fe_to_be_bytes(&sum)
 }
@@ -439,6 +454,15 @@ mod tests {
         };
         assert_eq!(add_scalars_mod_n(&n_minus_one, &scalar(1)), [0u8; 32]);
         assert_eq!(add_scalars_mod_n(&n_minus_one, &scalar(2)), scalar(1));
+    }
+
+    /// `n` itself is the first value out of range, and the one a bound stated as
+    /// `n >= operand` would have let through.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "below the group order")]
+    fn scalar_addition_rejects_an_operand_at_the_order() {
+        add_scalars_mod_n(&fe_to_be_bytes(&N), &scalar(1));
     }
 
     /// Validate the whole table against profanity2's checked-in precomp.cpp.
