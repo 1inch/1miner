@@ -41,8 +41,19 @@ jobs:
         run: |
           docker run --rm 1miner:ci --help | grep -q 'Usage: 1miner'
           docker run --rm 1miner:ci clinfo --version
-          # No GPU on the runner, so a real search must fail to start.
+          # MINER_OUTPUT used to tee through a pipeline, which left the shell
+          # alive to run the binary a second time. One banner, not two. The
+          # entrypoint tests cover the rest; this one needs the real image,
+          # because it is bash and /dev/fd inside the container that are at
+          # stake.
+          banners=$(docker run --rm -e MINER_OUTPUT=/tmp/run.log 1miner:ci --version | grep -c '^1miner ' || true)
+          [ "$banners" = "1" ] || { echo "the entrypoint printed $banners version banners" >&2; exit 1; }
+          # No GPU on the runner, so a real search must fail to start — with
+          # MINER_OUTPUT set as well, where the failure used to be swallowed.
           ! docker run --rm 1miner:ci create3 \
+            --deployer 0x0000000000000000000000000000000000000001 \
+            --leading 0
+          ! docker run --rm -e MINER_OUTPUT=/tmp/run.log 1miner:ci create3 \
             --deployer 0x0000000000000000000000000000000000000001 \
             --leading 0
 

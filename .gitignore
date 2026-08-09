@@ -11,3 +11,5 @@ references/**/cache-opencl.*
 .DS_Store
 
 .venv
+
+audit/

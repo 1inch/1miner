@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Container entrypoint for 1miner.
 #
 # Arguments pass straight through to the binary. Two conveniences exist for
@@ -10,6 +10,23 @@
 # debugging. That check is an explicit allowlist of subcommands rather than a
 # "does it start with a dash" test, because 1miner's own subcommands do not.
 set -eu
+
+# Redirect the whole script, before anything else writes or execs.
+#
+# Not `exec 1miner "$@" | tee`: exec replaces only the pipeline's left-hand
+# subshell, so the shell survived, the pipeline reported tee's status of 0, and
+# control fell through to the exec at the end of the file — running the search a
+# second time, unlogged, on someone else's hourly rate.
+#
+# Redirecting here rather than beside that exec also covers the startup warnings
+# and the `sh -c '1miner self-test && 1miner ...'` form docs/vastai.md
+# recommends, which leaves through the passthrough below. Process substitution
+# needs bash, which debian:bookworm-slim has; tee stops being the container's
+# main process, so 1miner keeps its own exit status and its own signals.
+if [ -n "${MINER_OUTPUT:-}" ]; then
+    mkdir -p "$(dirname "$MINER_OUTPUT")"
+    exec 1> >(tee -a "$MINER_OUTPUT") 2>&1
+fi
 
 is_subcommand() {
     case "$1" in
@@ -58,11 +75,6 @@ if [ "$wants_gpu" = "1" ] && [ "${MINER_SKIP_GPU_CHECK:-0}" != "1" ]; then
         echo "  'docker run --rm --gpus all <image> clinfo' shows what the runtime sees." >&2
         echo "  Set MINER_SKIP_GPU_CHECK=1 to silence this." >&2
     fi
-fi
-
-if [ -n "${MINER_OUTPUT:-}" ]; then
-    mkdir -p "$(dirname "$MINER_OUTPUT")"
-    exec /usr/local/bin/1miner "$@" 2>&1 | tee -a "$MINER_OUTPUT"
 fi
 
 exec /usr/local/bin/1miner "$@"

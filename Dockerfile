@@ -63,6 +63,8 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 # files to keep beside it and no working-directory requirement.
 COPY --from=build /src/target/release/1miner /usr/local/bin/1miner
 COPY LICENSE /usr/share/doc/1miner/LICENSE
+# The entrypoint needs bash for the MINER_OUTPUT redirect, which bookworm-slim
+# has and a slimmer base such as alpine would not.
 COPY docker/entrypoint.sh /usr/local/bin/1miner-entrypoint
 RUN chmod +x /usr/local/bin/1miner-entrypoint /usr/local/bin/1miner \
     && mkdir -p /workspace
