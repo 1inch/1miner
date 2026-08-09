@@ -228,7 +228,10 @@ impl CpuBackend {
 fn neon_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        !matches!(std::env::var("MINER_NO_NEON").as_deref(), Ok("1") | Ok("true"))
+        !matches!(
+            std::env::var("MINER_NO_NEON").as_deref(),
+            Ok("1") | Ok("true")
+        )
     })
 }
 

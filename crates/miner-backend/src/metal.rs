@@ -62,8 +62,7 @@ pub struct MetalBackend {
 
 impl MetalBackend {
     pub fn new() -> Result<Self> {
-        let device = MTLCreateSystemDefaultDevice()
-            .ok_or(BackendError::NoDevices("metal"))?;
+        let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::NoDevices("metal"))?;
         let infos = vec![DeviceInfo {
             index: 0,
             name: device.name().to_string(),
@@ -138,7 +137,11 @@ impl MetalBackend {
 
         let threadgroup = pipeline
             .maxTotalThreadsPerThreadgroup()
-            .min(if job.tuning.work_size > 0 { job.tuning.work_size } else { 256 })
+            .min(if job.tuning.work_size > 0 {
+                job.tuning.work_size
+            } else {
+                256
+            })
             .max(1);
 
         let start = Instant::now();
@@ -178,9 +181,9 @@ impl MetalBackend {
             let command_buffer = queue
                 .commandBuffer()
                 .ok_or_else(|| BackendError::Other("failed to create a command buffer".into()))?;
-            let encoder = command_buffer.computeCommandEncoder().ok_or_else(|| {
-                BackendError::Other("failed to create a compute encoder".into())
-            })?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| BackendError::Other("failed to create a compute encoder".into()))?;
 
             encoder.setComputePipelineState(&pipeline);
             unsafe {
@@ -190,8 +193,16 @@ impl MetalBackend {
                 encoder.setBuffer_offset_atIndex(Some(&flags), 0, 3);
             }
             encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize { width: job.tuning.round_size, height: 1, depth: 1 },
-                MTLSize { width: threadgroup, height: 1, depth: 1 },
+                MTLSize {
+                    width: job.tuning.round_size,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threadgroup,
+                    height: 1,
+                    depth: 1,
+                },
             );
             encoder.endEncoding();
             command_buffer.commit();
@@ -220,9 +231,13 @@ impl MetalBackend {
 
 /// Push a small struct straight into the command encoder rather than
 /// allocating a buffer for it.
-unsafe fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {
-    let ptr = NonNull::new(std::ptr::from_ref(value) as *mut c_void)
-        .expect("reference is never null");
+unsafe fn set_bytes<T>(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    value: &T,
+    index: usize,
+) {
+    let ptr =
+        NonNull::new(std::ptr::from_ref(value) as *mut c_void).expect("reference is never null");
     unsafe { encoder.setBytes_length_atIndex(ptr, size_of::<T>(), index) };
 }
 
@@ -312,7 +327,10 @@ mod tests {
             ("kLeadingRange", ScoreFn::LeadingRange as u32),
         ] {
             let expected = format!("constant uint {name} = {value};");
-            assert!(SALT_SOURCE.contains(&expected), "missing or wrong: {expected}");
+            assert!(
+                SALT_SOURCE.contains(&expected),
+                "missing or wrong: {expected}"
+            );
         }
     }
 }

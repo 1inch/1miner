@@ -239,7 +239,12 @@ fn create_state_for(proxy: &Address) -> [u64; 25] {
 }
 
 /// Derive two addresses at once for two work items of the same job.
-pub fn addresses(cfg: &SaltConfig, device_index: u32, global_ids: [u32; LANES], round: u32) -> [Address; LANES] {
+pub fn addresses(
+    cfg: &SaltConfig,
+    device_index: u32,
+    global_ids: [u32; LANES],
+    round: u32,
+) -> [Address; LANES] {
     debug_assert_eq!(STATE_WORDS, 50, "state layout changed");
 
     let a = state_for(cfg, device_index, global_ids[0], round);
@@ -296,7 +301,8 @@ mod tests {
                     for (lane, id) in pair.iter().enumerate() {
                         let want = cfg.address_for_salt(&cfg.salt_at(0, *id, round));
                         assert_eq!(
-                            got[lane], want,
+                            got[lane],
+                            want,
                             "{} mismatch at gid {id} round {round}",
                             mode.as_str()
                         );

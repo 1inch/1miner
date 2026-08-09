@@ -89,7 +89,11 @@ fn add_mod(a: &Fe, b: &Fe, m: &Fe) -> Fe {
 
 fn sub_mod(a: &Fe, b: &Fe, m: &Fe) -> Fe {
     let (diff, borrow) = sub_raw(a, b);
-    if borrow == 1 { add_raw(&diff, m).0 } else { diff }
+    if borrow == 1 {
+        add_raw(&diff, m).0
+    } else {
+        diff
+    }
 }
 
 fn fe_add(a: &Fe, b: &Fe) -> Fe {
@@ -292,7 +296,10 @@ pub fn parse_public_key(s: &str) -> Result<Point> {
     let mut y = [0u8; 32];
     x.copy_from_slice(&bytes[..32]);
     y.copy_from_slice(&bytes[32..]);
-    let point = Point { x: fe_from_be_bytes(&x), y: fe_from_be_bytes(&y) };
+    let point = Point {
+        x: fe_from_be_bytes(&x),
+        y: fe_from_be_bytes(&y),
+    };
     if !point.is_on_curve() {
         return Err(CoreError::Parse(
             "public key is not a point on secp256k1".into(),
@@ -379,7 +386,10 @@ mod tests {
     #[test]
     fn a_plus_negative_a_is_infinity() {
         let a = scalar_mul_generator(&scalar(5)).unwrap();
-        let neg = Point { x: a.x, y: fe_sub(&[0, 0, 0, 0], &a.y) };
+        let neg = Point {
+            x: a.x,
+            y: fe_sub(&[0, 0, 0, 0], &a.y),
+        };
         assert!(point_add(Some(&a), Some(&neg)).is_none());
     }
 
@@ -467,8 +477,16 @@ mod tests {
         let table = generator_table();
         for (i, point) in table.iter().enumerate() {
             let base = i * 16;
-            assert_eq!(point.x, to_fe(&words[base..base + 8]), "x mismatch at index {i}");
-            assert_eq!(point.y, to_fe(&words[base + 8..base + 16]), "y mismatch at index {i}");
+            assert_eq!(
+                point.x,
+                to_fe(&words[base..base + 8]),
+                "x mismatch at index {i}"
+            );
+            assert_eq!(
+                point.y,
+                to_fe(&words[base + 8..base + 16]),
+                "y mismatch at index {i}"
+            );
         }
     }
 

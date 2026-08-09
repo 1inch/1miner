@@ -19,7 +19,13 @@ pub struct TerminalReporter {
 
 impl TerminalReporter {
     pub fn new(mode: MineMode, quiet: bool) -> Self {
-        Self { mode, start: Instant::now(), quiet, hits: 0, unverified: 0 }
+        Self {
+            mode,
+            start: Instant::now(),
+            quiet,
+            hits: 0,
+            unverified: 0,
+        }
     }
 }
 

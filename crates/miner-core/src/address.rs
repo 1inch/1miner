@@ -14,8 +14,9 @@ pub type Salt = [u8; 32];
 /// Minimal CREATE3 proxy (Solady/solmate). Deployed via CREATE2, it then
 /// CREATEs the real contract, which is why a CREATE3 address does not depend
 /// on the deployed contract's init code.
-pub const PROXY_CHILD_BYTECODE: [u8; 16] =
-    [0x67, 0x36, 0x3d, 0x3d, 0x37, 0x36, 0x3d, 0x34, 0xf0, 0x3d, 0x52, 0x60, 0x08, 0x60, 0x18, 0xf3];
+pub const PROXY_CHILD_BYTECODE: [u8; 16] = [
+    0x67, 0x36, 0x3d, 0x3d, 0x37, 0x36, 0x3d, 0x34, 0xf0, 0x3d, 0x52, 0x60, 0x08, 0x60, 0x18, 0xf3,
+];
 
 /// `keccak256(PROXY_CHILD_BYTECODE)`, asserted in tests rather than trusted.
 pub const DEFAULT_PROXY_CODE_HASH: Hash = [
@@ -52,7 +53,10 @@ pub fn eoa_address(pubkey_x: &[u8; 32], pubkey_y: &[u8; 32]) -> Address {
 /// nonce 0 for profanity's `--contract` scoring and nonce 1 for the CREATE3
 /// proxy. RLP encodes a zero nonce as the empty string `0x80`, not as `0x00`.
 pub fn create_address(sender: &Address, nonce: u8) -> Address {
-    assert!(nonce < 0x80, "create_address supports single-byte nonces below 0x80");
+    assert!(
+        nonce < 0x80,
+        "create_address supports single-byte nonces below 0x80"
+    );
     let mut buf = [0u8; 23];
     buf[0] = 0xd6; // list, 22 bytes payload
     buf[1] = 0x94; // string, 20 bytes
@@ -218,11 +222,26 @@ mod tests {
         let account = parse_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
 
         let cases = [
-            ("83e07be8812a93bc76504bc8c10f79c7", "0x000000a6C09bd7f6Ba10642DBaCe1bE60565A2F8"),
-            ("a245d3d1f4bc5e70beb85db24b6f4df1", "0xc07EC7da97D7444F738e955f28F6C91d15000000"),
-            ("4a7beee747938760a0fbd441e3ce93f5", "0x6828985368578258349260531646495303581057"),
-            ("057b69fd8b880100129d0f0000000000", "0x6666665e4d6a736100A7D8eD5dfBacDf99f29DFf"),
-            ("00000000000000000000000000000000", "0x89E802345bfB6CaD865fb5935fb6749D65D25764"),
+            (
+                "83e07be8812a93bc76504bc8c10f79c7",
+                "0x000000a6C09bd7f6Ba10642DBaCe1bE60565A2F8",
+            ),
+            (
+                "a245d3d1f4bc5e70beb85db24b6f4df1",
+                "0xc07EC7da97D7444F738e955f28F6C91d15000000",
+            ),
+            (
+                "4a7beee747938760a0fbd441e3ce93f5",
+                "0x6828985368578258349260531646495303581057",
+            ),
+            (
+                "057b69fd8b880100129d0f0000000000",
+                "0x6666665e4d6a736100A7D8eD5dfBacDf99f29DFf",
+            ),
+            (
+                "00000000000000000000000000000000",
+                "0x89E802345bfB6CaD865fb5935fb6749D65D25764",
+            ),
         ];
 
         for (magic_hex, expected) in cases {
@@ -238,7 +257,8 @@ mod tests {
     }
 
     #[test]
-    fn nft_salt_pins_low_half_to_caller() {        let caller = parse_address("0x00000000219ab540356cbb839cbe05303d7705fa").unwrap();
+    fn nft_salt_pins_low_half_to_caller() {
+        let caller = parse_address("0x00000000219ab540356cbb839cbe05303d7705fa").unwrap();
         let magic = [0xABu8; 16];
         let salt = nft_salt(&magic, &caller);
         assert_eq!(&salt[..16], &magic);

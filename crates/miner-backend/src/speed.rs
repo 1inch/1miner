@@ -104,7 +104,11 @@ impl SpeedMeter {
             return None;
         }
         let hashes = last.saturating_sub(base);
-        Some(SpeedSummary { rate: hashes as f64 / elapsed.as_secs_f64(), hashes, elapsed })
+        Some(SpeedSummary {
+            rate: hashes as f64 / elapsed.as_secs_f64(),
+            hashes,
+            elapsed,
+        })
     }
 }
 
@@ -117,7 +121,11 @@ pub fn combine(summaries: &[Option<SpeedSummary>]) -> Option<SpeedSummary> {
         hashes: present.iter().map(|s| s.hashes).sum(),
         // Devices run concurrently for the same wall time, so the longest span
         // describes the measurement rather than the sum of them.
-        elapsed: present.iter().map(|s| s.elapsed).max().unwrap_or(first.elapsed),
+        elapsed: present
+            .iter()
+            .map(|s| s.elapsed)
+            .max()
+            .unwrap_or(first.elapsed),
     })
 }
 
@@ -201,8 +209,16 @@ mod tests {
 
     #[test]
     fn combine_sums_rates_and_takes_the_longest_span() {
-        let a = SpeedSummary { rate: 100.0, hashes: 200, elapsed: Duration::from_secs(2) };
-        let b = SpeedSummary { rate: 50.0, hashes: 150, elapsed: Duration::from_secs(3) };
+        let a = SpeedSummary {
+            rate: 100.0,
+            hashes: 200,
+            elapsed: Duration::from_secs(2),
+        };
+        let b = SpeedSummary {
+            rate: 50.0,
+            hashes: 150,
+            elapsed: Duration::from_secs(3),
+        };
         let c = combine(&[Some(a), Some(b), None]).unwrap();
         assert_eq!(c.rate, 150.0);
         assert_eq!(c.hashes, 350);

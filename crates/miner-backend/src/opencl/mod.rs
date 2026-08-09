@@ -77,9 +77,8 @@ fn cache_dir() -> Option<PathBuf> {
 /// constants are part of `options`, so a new deployer or salt yields a new key
 /// and can never reuse a stale binary.
 fn cache_key(source: &str, options: &str, device_name: &str) -> String {
-    let digest = miner_core::keccak256(
-        format!("{device_name}\u{0}{options}\u{0}{source}").as_bytes(),
-    );
+    let digest =
+        miner_core::keccak256(format!("{device_name}\u{0}{options}\u{0}{source}").as_bytes());
     hex::encode(&digest[..16])
 }
 

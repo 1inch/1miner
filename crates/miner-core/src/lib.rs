@@ -14,7 +14,7 @@ pub mod secp256k1;
 
 pub use address::{
     Address, DEFAULT_PROXY_CODE_HASH, Hash, ONEINCH_NFT_DEPLOYER, PROXY_CHILD_BYTECODE, Salt,
-    create2_address, create2_preimage, create3_address, create_address, eoa_address, nft_salt,
+    create_address, create2_address, create2_preimage, create3_address, eoa_address, nft_salt,
 };
 pub use hexutil::{parse_address, parse_hash, parse_hex, parse_magic, to_checksum_address};
 pub use mode::{MineMode, ModeConfig, ProfanityConfig, SaltConfig};

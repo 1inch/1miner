@@ -36,7 +36,11 @@ struct ClMode {
 
 impl From<&ScoreSpec> for ClMode {
     fn from(spec: &ScoreSpec) -> Self {
-        Self { function: spec.function as cl_uint, data1: spec.data1, data2: spec.data2 }
+        Self {
+            function: spec.function as cl_uint,
+            data1: spec.data1,
+            data2: spec.data2,
+        }
     }
 }
 

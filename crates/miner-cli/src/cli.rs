@@ -301,7 +301,10 @@ impl ScoringArgs {
             chosen.push(("--exact", ScoreSpec::matching(p)?));
         }
         if self.leading_range {
-            chosen.push(("--leading-range", ScoreSpec::leading_range(self.min, self.max)?));
+            chosen.push((
+                "--leading-range",
+                ScoreSpec::leading_range(self.min, self.max)?,
+            ));
         }
         if self.range {
             chosen.push(("--range", ScoreSpec::range(self.min, self.max)?));
@@ -416,18 +419,31 @@ mod tests {
         let none = ScoringArgs::default();
         assert!(none.resolve().is_err());
 
-        let one = ScoringArgs { zeros: true, ..Default::default() };
+        let one = ScoringArgs {
+            zeros: true,
+            ..Default::default()
+        };
         assert!(one.resolve().is_ok());
 
-        let two = ScoringArgs { zeros: true, letters: true, ..Default::default() };
+        let two = ScoringArgs {
+            zeros: true,
+            letters: true,
+            ..Default::default()
+        };
         let err = two.resolve().unwrap_err().to_string();
-        assert!(err.contains("--zeros") && err.contains("--letters"), "{err}");
+        assert!(
+            err.contains("--zeros") && err.contains("--letters"),
+            "{err}"
+        );
     }
 
     #[test]
     fn deployer_is_required_unless_benchmarking() {
         assert!(resolve_deployer(None, MineMode::Nft, false).is_err());
-        assert_eq!(resolve_deployer(None, MineMode::Nft, true).unwrap(), [0u8; 20]);
+        assert_eq!(
+            resolve_deployer(None, MineMode::Nft, true).unwrap(),
+            [0u8; 20]
+        );
         let addr = "0x9fBB3DF7C40Da2e5A0dE984fFE2CCB7C47cd0ABf".to_string();
         assert!(resolve_deployer(Some(&addr), MineMode::Create3, false).is_ok());
     }
@@ -447,6 +463,9 @@ mod tests {
 
     #[test]
     fn bytecode_hash_defaults_to_the_standard_proxy() {
-        assert_eq!(resolve_bytecode_hash(None).unwrap(), DEFAULT_PROXY_CODE_HASH);
+        assert_eq!(
+            resolve_bytecode_hash(None).unwrap(),
+            DEFAULT_PROXY_CODE_HASH
+        );
     }
 }

@@ -212,7 +212,10 @@ fn run_profanity(
         .iter()
         .map(|p| {
             let (x, y) = p.to_bytes();
-            ClPoint { x: to_mp(&x), y: to_mp(&y) }
+            ClPoint {
+                x: to_mp(&x),
+                y: to_mp(&y),
+            }
         })
         .collect();
 
@@ -230,8 +233,7 @@ fn run_profanity(
     std::thread::scope(|scope| {
         for (slot, (device_id, info)) in ids.iter().zip(infos).enumerate() {
             let (source, options, precomp) = (&source, &options, &precomp);
-            let (counters, hits, best_score, failure) =
-                (&counters, &hits, &best_score, &failure);
+            let (counters, hits, best_score, failure) = (&counters, &hits, &best_score, &failure);
 
             scope.spawn(move || {
                 let outcome = run_device(
@@ -335,7 +337,12 @@ fn run_device(
     let size = job.tuning.profanity_round_size();
 
     let mut mem_precomp = unsafe {
-        Buffer::<ClPoint>::create(&context, CL_MEM_READ_ONLY, precomp.len(), std::ptr::null_mut())
+        Buffer::<ClPoint>::create(
+            &context,
+            CL_MEM_READ_ONLY,
+            precomp.len(),
+            std::ptr::null_mut(),
+        )
     }
     .map_err(cl_err("failed to allocate precomp buffer"))?;
     let mem_delta_x = unsafe {
@@ -351,7 +358,12 @@ fn run_device(
     }
     .map_err(cl_err("failed to allocate lambda buffer"))?;
     let mut mem_result = unsafe {
-        Buffer::<ClResult>::create(&context, CL_MEM_READ_WRITE, MAX_SCORE + 1, std::ptr::null_mut())
+        Buffer::<ClResult>::create(
+            &context,
+            CL_MEM_READ_WRITE,
+            MAX_SCORE + 1,
+            std::ptr::null_mut(),
+        )
     }
     .map_err(cl_err("failed to allocate result buffer"))?;
     let mut mem_data1 =
@@ -420,9 +432,10 @@ fn run_device(
             break;
         }
 
-        let read_event =
-            unsafe { queue.enqueue_read_buffer(&mem_result, CL_NON_BLOCKING, 0, &mut results, &[]) }
-                .map_err(cl_err("failed to read results"))?;
+        let read_event = unsafe {
+            queue.enqueue_read_buffer(&mem_result, CL_NON_BLOCKING, 0, &mut results, &[])
+        }
+        .map_err(cl_err("failed to read results"))?;
 
         // In-order queue: this lands after the read above and before the
         // kernels below.
@@ -444,16 +457,23 @@ fn run_device(
                 exec.set_arg(&mem_delta_x).set_arg(&mem_inversed);
             },
         )?;
-        enqueue_chunked(&queue, &kernel_iterate, size, work_max, local, |exec| unsafe {
-            exec.set_arg(&mem_delta_x)
-                .set_arg(&mem_inversed)
-                .set_arg(&mem_prev_lambda)
-                .set_arg(&mem_result)
-                .set_arg(&mem_data1)
-                .set_arg(&mem_data2)
-                .set_arg(&local_best)
-                .set_arg(&is_contract);
-        })?;
+        enqueue_chunked(
+            &queue,
+            &kernel_iterate,
+            size,
+            work_max,
+            local,
+            |exec| unsafe {
+                exec.set_arg(&mem_delta_x)
+                    .set_arg(&mem_inversed)
+                    .set_arg(&mem_prev_lambda)
+                    .set_arg(&mem_result)
+                    .set_arg(&mem_data1)
+                    .set_arg(&mem_data2)
+                    .set_arg(&local_best)
+                    .set_arg(&is_contract);
+            },
+        )?;
 
         queue.flush().map_err(cl_err("flush failed"))?;
         read_event.wait().map_err(cl_err("result read failed"))?;
@@ -482,9 +502,15 @@ fn run_device(
             // it lands on the reported address. A mismatch means the offset
             // accounting is wrong and the key would be useless.
             let verified = !job.verify
-                || miner_core::secp256k1::address_for_offset(&cfg.seed_public_key, &offset)
-                    .map(|p| if cfg.contract { miner_core::create_address(&p, 0) } else { p })
-                    == Some(address);
+                || miner_core::secp256k1::address_for_offset(&cfg.seed_public_key, &offset).map(
+                    |p| {
+                        if cfg.contract {
+                            miner_core::create_address(&p, 0)
+                        } else {
+                            p
+                        }
+                    },
+                ) == Some(address);
 
             hits.lock().unwrap().push(Hit {
                 score: score as u32,
@@ -518,7 +544,8 @@ fn enqueue_chunked(
         unsafe {
             let mut exec = ExecuteKernel::new(kernel);
             set_args(&mut exec);
-            exec.set_global_work_offset(offset).set_global_work_size(run);
+            exec.set_global_work_offset(offset)
+                .set_global_work_size(run);
             if local > 0 && run % local == 0 {
                 exec.set_local_work_size(local);
             }
@@ -537,7 +564,12 @@ mod tests {
     use super::*;
 
     fn info(index: usize) -> DeviceInfo {
-        DeviceInfo { index, name: String::new(), compute_units: 0, global_memory: 0 }
+        DeviceInfo {
+            index,
+            name: String::new(),
+            compute_units: 0,
+            global_memory: 0,
+        }
     }
 
     #[test]
@@ -594,7 +626,10 @@ mod tests {
         for device in 0..4 {
             let last = offset_scalar(&shared(device), u64::MAX >> 1, widest);
             let first_of_next = offset_scalar(&shared(device + 1), 0, 0);
-            assert!(last < first_of_next, "device {device} reaches into the next slot");
+            assert!(
+                last < first_of_next,
+                "device {device} reaches into the next slot"
+            );
         }
     }
 

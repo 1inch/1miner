@@ -57,7 +57,9 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
         return None;
     }
 
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("entrypoint").join(name);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("entrypoint")
+        .join(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
@@ -67,7 +69,10 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
 
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/entrypoint.sh");
     let script = fs::read_to_string(&source).unwrap();
-    assert!(script.contains(MINER_BIN), "the entrypoint no longer execs {MINER_BIN}");
+    assert!(
+        script.contains(MINER_BIN),
+        "the entrypoint no longer execs {MINER_BIN}"
+    );
     assert!(
         script.starts_with("#!/bin/bash"),
         "the MINER_OUTPUT redirect is a bash process substitution, which sh cannot run"
@@ -75,7 +80,11 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
 
     // Executed through its own shebang, the way the image runs it.
     let entrypoint = dir.join("entrypoint.sh");
-    fs::write(&entrypoint, script.replace(MINER_BIN, stub.to_str().unwrap())).unwrap();
+    fs::write(
+        &entrypoint,
+        script.replace(MINER_BIN, stub.to_str().unwrap()),
+    )
+    .unwrap();
     fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o755)).unwrap();
 
     let runs = dir.join("runs");
@@ -98,10 +107,12 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
     Some(Run {
         status: out.status,
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        runs: fs::read_to_string(&runs).unwrap_or_default().lines().map(str::to_owned).collect(),
-        log: log.map(|p| {
-            fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
-        }),
+        runs: fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        log: log.map(|p| fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))),
     })
 }
 
@@ -109,11 +120,17 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
 /// sandbox that forbids `/dev/fd` cannot run these tests at all, so skip rather
 /// than report a failure that does not belong to the script.
 fn usable_shell() -> bool {
-    match Command::new("bash").args(["-c", "exec 1> >(cat >/dev/null)"]).output() {
+    match Command::new("bash")
+        .args(["-c", "exec 1> >(cat >/dev/null)"])
+        .output()
+    {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             let why = String::from_utf8_lossy(&out.stderr);
-            eprintln!("skipping entrypoint test: no process substitution here: {}", why.trim());
+            eprintln!(
+                "skipping entrypoint test: no process substitution here: {}",
+                why.trim()
+            );
             false
         }
         Err(e) => {
@@ -129,15 +146,31 @@ fn usable_shell() -> bool {
 #[test]
 fn miner_output_runs_the_miner_exactly_once() {
     let args = ["create3", "--leading", "0"];
-    let Some(run) = run("once", &args, &[], Some("logs/hits.log")) else { return };
+    let Some(run) = run("once", &args, &[], Some("logs/hits.log")) else {
+        return;
+    };
 
-    assert_eq!(run.runs, ["create3 --leading 0"], "one search, with the given arguments");
+    assert_eq!(
+        run.runs,
+        ["create3 --leading 0"],
+        "one search, with the given arguments"
+    );
     assert!(run.status.success(), "{:?}", run.status);
-    assert_eq!(run.stdout.matches("out: ").count(), 1, "tee passes the output through once");
+    assert_eq!(
+        run.stdout.matches("out: ").count(),
+        1,
+        "tee passes the output through once"
+    );
 
     let log = run.log.unwrap();
-    assert!(log.contains("out: create3 --leading 0"), "stdout missing from the log: {log:?}");
-    assert!(log.contains("err: create3 --leading 0"), "stderr missing from the log: {log:?}");
+    assert!(
+        log.contains("out: create3 --leading 0"),
+        "stdout missing from the log: {log:?}"
+    );
+    assert!(
+        log.contains("err: create3 --leading 0"),
+        "stderr missing from the log: {log:?}"
+    );
 }
 
 /// The pipeline reported tee's status, so `set -e` saw nothing wrong and the
@@ -147,10 +180,21 @@ fn miner_output_runs_the_miner_exactly_once() {
 fn the_miners_exit_status_survives_miner_output() {
     let args = ["create3", "--leading", "0"];
     let env = [("STUB_EXIT", "3")];
-    let Some(run) = run("status", &args, &env, Some("hits.log")) else { return };
+    let Some(run) = run("status", &args, &env, Some("hits.log")) else {
+        return;
+    };
 
-    assert_eq!(run.status.code(), Some(3), "the miner's own status did not get out");
-    assert_eq!(run.runs.len(), 1, "a failed search was retried: {:?}", run.runs);
+    assert_eq!(
+        run.status.code(),
+        Some(3),
+        "the miner's own status did not get out"
+    );
+    assert_eq!(
+        run.runs.len(),
+        1,
+        "a failed search was retried: {:?}",
+        run.runs
+    );
 }
 
 /// The path CI's smoke test takes, and the one that was always correct. Here so
@@ -160,7 +204,9 @@ fn the_miners_exit_status_survives_miner_output() {
 fn the_unlogged_path_keeps_its_status_too() {
     let args = ["create3", "--leading", "0"];
     let env = [("STUB_EXIT", "2")];
-    let Some(run) = run("plain", &args, &env, None) else { return };
+    let Some(run) = run("plain", &args, &env, None) else {
+        return;
+    };
 
     assert_eq!(run.status.code(), Some(2));
     assert_eq!(run.runs.len(), 1, "{:?}", run.runs);
@@ -172,12 +218,25 @@ fn the_unlogged_path_keeps_its_status_too() {
 #[test]
 fn miner_output_covers_the_passthrough_form() {
     let args = ["sh", "-c", "echo from-passthrough; exit 4"];
-    let Some(run) = run("passthrough", &args, &[], Some("hits.log")) else { return };
+    let Some(run) = run("passthrough", &args, &[], Some("hits.log")) else {
+        return;
+    };
 
-    assert_eq!(run.status.code(), Some(4), "the passthrough lost its exit status");
-    assert!(run.runs.is_empty(), "the miner ran when it should not have: {:?}", run.runs);
+    assert_eq!(
+        run.status.code(),
+        Some(4),
+        "the passthrough lost its exit status"
+    );
+    assert!(
+        run.runs.is_empty(),
+        "the miner ran when it should not have: {:?}",
+        run.runs
+    );
     let log = run.log.unwrap();
-    assert!(log.contains("from-passthrough"), "the passthrough was not logged: {log:?}");
+    assert!(
+        log.contains("from-passthrough"),
+        "the passthrough was not logged: {log:?}"
+    );
 }
 
 /// `MINER_ARGS` is the only way to configure a run on a hosting panel that
@@ -185,7 +244,9 @@ fn miner_output_covers_the_passthrough_form() {
 #[test]
 fn miner_args_reaches_the_miner_once() {
     let env = [("MINER_ARGS", "create2 --leading 0")];
-    let Some(run) = run("miner_args", &[], &env, Some("hits.log")) else { return };
+    let Some(run) = run("miner_args", &[], &env, Some("hits.log")) else {
+        return;
+    };
 
     assert_eq!(run.runs, ["create2 --leading 0"]);
     let log = run.log.unwrap();

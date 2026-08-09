@@ -58,10 +58,22 @@ pub fn run(common: &CommonArgs) -> anyhow::Result<()> {
     println!("\nBackend agreement ({})", common.backend);
     for mode in [MineMode::Create2, MineMode::Create3, MineMode::Nft] {
         match planted_target(mode, common) {
-            Ok(true) => check(&mut failures, &format!("{} planted target", mode.as_str()), true),
-            Ok(false) => check(&mut failures, &format!("{} planted target", mode.as_str()), false),
+            Ok(true) => check(
+                &mut failures,
+                &format!("{} planted target", mode.as_str()),
+                true,
+            ),
+            Ok(false) => check(
+                &mut failures,
+                &format!("{} planted target", mode.as_str()),
+                false,
+            ),
             Err(e) => {
-                check(&mut failures, &format!("{} planted target", mode.as_str()), false);
+                check(
+                    &mut failures,
+                    &format!("{} planted target", mode.as_str()),
+                    false,
+                );
                 println!("      {e}");
             }
         }
@@ -138,7 +150,14 @@ fn planted_target(mode: MineMode, common: &CommonArgs) -> anyhow::Result<bool> {
         move || stop.load(Ordering::SeqCst) || found.load(Ordering::SeqCst)
     };
 
-    backend.run(&job, &mut WatchFor { inner: &mut collector, found: Arc::clone(&found) }, &should_stop)?;
+    backend.run(
+        &job,
+        &mut WatchFor {
+            inner: &mut collector,
+            found: Arc::clone(&found),
+        },
+        &should_stop,
+    )?;
 
     let best = collector.hits.iter().max_by_key(|h| h.score);
     Ok(match best {

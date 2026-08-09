@@ -33,7 +33,11 @@ pub struct ScoreSpec {
 
 impl ScoreSpec {
     fn new(function: ScoreFn) -> Self {
-        Self { function, data1: [0; 20], data2: [0; 20] }
+        Self {
+            function,
+            data1: [0; 20],
+            data2: [0; 20],
+        }
     }
 
     pub fn benchmark() -> Self {
@@ -278,10 +282,19 @@ mod tests {
     #[test]
     fn leading_counts_nibbles_and_stops() {
         let spec = ScoreSpec::leading('0').unwrap();
-        assert_eq!(score(&spec, &addr("0x0000012300000000000000000000000000000000")), 5);
-        assert_eq!(score(&spec, &addr("0x1000000000000000000000000000000000000000")), 0);
+        assert_eq!(
+            score(&spec, &addr("0x0000012300000000000000000000000000000000")),
+            5
+        );
+        assert_eq!(
+            score(&spec, &addr("0x1000000000000000000000000000000000000000")),
+            0
+        );
         // A full run of zeroes scores every nibble.
-        assert_eq!(score(&spec, &addr("0x0000000000000000000000000000000000000000")), 40);
+        assert_eq!(
+            score(&spec, &addr("0x0000000000000000000000000000000000000000")),
+            40
+        );
     }
 
     #[test]
@@ -296,7 +309,10 @@ mod tests {
     #[test]
     fn zero_bytes_counts_whole_bytes() {
         assert_eq!(
-            score(&ScoreSpec::zero_bytes(), &addr("0x0000dead00000000000000000000000000000000")),
+            score(
+                &ScoreSpec::zero_bytes(),
+                &addr("0x0000dead00000000000000000000000000000000")
+            ),
             18
         );
     }
@@ -313,13 +329,22 @@ mod tests {
     #[test]
     fn matching_is_left_anchored_and_wildcards_are_free() {
         let spec = ScoreSpec::matching("dead").unwrap();
-        assert_eq!(score(&spec, &addr("0xdead000000000000000000000000000000000000")), 2);
-        assert_eq!(score(&spec, &addr("0xde00000000000000000000000000000000000000")), 1);
+        assert_eq!(
+            score(&spec, &addr("0xdead000000000000000000000000000000000000")),
+            2
+        );
+        assert_eq!(
+            score(&spec, &addr("0xde00000000000000000000000000000000000000")),
+            1
+        );
 
         // "de..beef" leaves byte 1 unconstrained, so it contributes nothing.
         let wild = ScoreSpec::matching("de..beef").unwrap();
         assert_eq!(wild.data1[1], 0);
-        assert_eq!(score(&wild, &addr("0xdeffbeef00000000000000000000000000000000")), 3);
+        assert_eq!(
+            score(&wild, &addr("0xdeffbeef00000000000000000000000000000000")),
+            3
+        );
     }
 
     #[test]
@@ -330,11 +355,20 @@ mod tests {
         assert_eq!(spec.data2[18], 0xbe);
         assert_eq!(spec.data2[19], 0xef);
         // Full match on both anchored bytes.
-        assert_eq!(score(&spec, &addr("0x000000000000000000000000000000000000beef")), 2);
+        assert_eq!(
+            score(&spec, &addr("0x000000000000000000000000000000000000beef")),
+            2
+        );
         // Only byte 18 lands correctly.
-        assert_eq!(score(&spec, &addr("0x000000000000000000000000000000000000beff")), 1);
+        assert_eq!(
+            score(&spec, &addr("0x000000000000000000000000000000000000beff")),
+            1
+        );
         // Shifted one byte right: neither anchored byte matches.
-        assert_eq!(score(&spec, &addr("0x0000000000000000000000000000000000beefff")), 0);
+        assert_eq!(
+            score(&spec, &addr("0x0000000000000000000000000000000000beefff")),
+            0
+        );
     }
 
     /// An odd-length pattern must put its last digit in the *low* nibble of
@@ -349,16 +383,28 @@ mod tests {
         // The half-masked byte still counts as constrained, so --exact-style
         // all-or-nothing comparisons stay reachable.
         assert_eq!(spec.constrained_bytes(), 2);
-        assert_eq!(score(&spec, &addr("0x0000000000000000000000000000000000000abc")), 2);
+        assert_eq!(
+            score(&spec, &addr("0x0000000000000000000000000000000000000abc")),
+            2
+        );
         // The nibble-shifted address is what this used to search for.
-        assert_eq!(score(&spec, &addr("0x000000000000000000000000000000000000abc0")), 0);
+        assert_eq!(
+            score(&spec, &addr("0x000000000000000000000000000000000000abc0")),
+            0
+        );
 
         // One digit constrains one nibble of the final byte and nothing else.
         let single = ScoreSpec::trailing("c").unwrap();
         assert_eq!((single.data1[19], single.data2[19]), (0x0f, 0x0c));
         assert_eq!(single.constrained_bytes(), 1);
-        assert_eq!(score(&single, &addr("0x000000000000000000000000000000000000000c")), 1);
-        assert_eq!(score(&single, &addr("0x00000000000000000000000000000000000000c0")), 0);
+        assert_eq!(
+            score(&single, &addr("0x000000000000000000000000000000000000000c")),
+            1
+        );
+        assert_eq!(
+            score(&single, &addr("0x00000000000000000000000000000000000000c0")),
+            0
+        );
     }
 
     /// Both anchors have to hold at every pattern length, not only the even
@@ -417,16 +463,25 @@ mod tests {
         // Bytes 9 and 10 are 0x12 and 0x21, so two nibbles mirror; bytes 8 and
         // 11 (0x34 vs 0x00) then disagree and stop the count.
         assert_eq!(
-            score(&ScoreSpec::mirror(), &addr("0x0000000000000000341221000000000000000000")),
+            score(
+                &ScoreSpec::mirror(),
+                &addr("0x0000000000000000341221000000000000000000")
+            ),
             2
         );
         // An all-zero address mirrors completely.
         assert_eq!(
-            score(&ScoreSpec::mirror(), &addr("0x0000000000000000000000000000000000000000")),
+            score(
+                &ScoreSpec::mirror(),
+                &addr("0x0000000000000000000000000000000000000000")
+            ),
             20
         );
         assert_eq!(
-            score(&ScoreSpec::mirror(), &addr("0x0000000000000000001200000000000000000000")),
+            score(
+                &ScoreSpec::mirror(),
+                &addr("0x0000000000000000001200000000000000000000")
+            ),
             0
         );
     }
@@ -435,17 +490,26 @@ mod tests {
     fn doubles_requires_matching_nibble_pairs() {
         // 00 aa 11 bb are pairs, 0x12 is not, so the run stops at four.
         assert_eq!(
-            score(&ScoreSpec::doubles(), &addr("0x00aa11bb12000000000000000000000000000000")),
+            score(
+                &ScoreSpec::doubles(),
+                &addr("0x00aa11bb12000000000000000000000000000000")
+            ),
             4
         );
         // A leading 0x01 is not a pair, so nothing counts.
         assert_eq!(
-            score(&ScoreSpec::doubles(), &addr("0x0102000000000000000000000000000000000000")),
+            score(
+                &ScoreSpec::doubles(),
+                &addr("0x0102000000000000000000000000000000000000")
+            ),
             0
         );
         // Trailing zero bytes are pairs too, so an all-zero address scores 20.
         assert_eq!(
-            score(&ScoreSpec::doubles(), &addr("0x0000000000000000000000000000000000000000")),
+            score(
+                &ScoreSpec::doubles(),
+                &addr("0x0000000000000000000000000000000000000000")
+            ),
             20
         );
     }
@@ -453,7 +517,10 @@ mod tests {
     #[test]
     fn benchmark_never_scores() {
         assert_eq!(
-            score(&ScoreSpec::benchmark(), &addr("0x0000000000000000000000000000000000000000")),
+            score(
+                &ScoreSpec::benchmark(),
+                &addr("0x0000000000000000000000000000000000000000")
+            ),
             0
         );
     }
@@ -475,9 +542,17 @@ mod tests {
         // A half-masked byte constrains that byte too: "abc" pads to ".abc".
         assert_eq!(ScoreSpec::trailing("abc").unwrap().constrained_bytes(), 2);
         // "de..beef" leaves byte 1 free, so three bytes are constrained.
-        assert_eq!(ScoreSpec::matching("de..beef").unwrap().constrained_bytes(), 3);
+        assert_eq!(
+            ScoreSpec::matching("de..beef").unwrap().constrained_bytes(),
+            3
+        );
         // A whole address is 20 bytes.
-        assert_eq!(ScoreSpec::matching(&"a".repeat(40)).unwrap().constrained_bytes(), 20);
+        assert_eq!(
+            ScoreSpec::matching(&"a".repeat(40))
+                .unwrap()
+                .constrained_bytes(),
+            20
+        );
         // Only masks constrain individual bytes.
         assert_eq!(ScoreSpec::zeros().constrained_bytes(), 0);
     }
@@ -488,7 +563,10 @@ mod tests {
     fn full_mask_match_scores_the_constrained_count() {
         let spec = ScoreSpec::matching("de..beef").unwrap();
         let want = spec.constrained_bytes();
-        assert_eq!(score(&spec, &addr("0xde99beef00000000000000000000000000000000")), want);
+        assert_eq!(
+            score(&spec, &addr("0xde99beef00000000000000000000000000000000")),
+            want
+        );
         assert!(score(&spec, &addr("0xde99beee00000000000000000000000000000000")) < want);
     }
 }

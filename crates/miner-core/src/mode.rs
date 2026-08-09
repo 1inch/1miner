@@ -6,7 +6,7 @@
 
 use crate::{
     Address, CoreError, Hash, Result, Salt,
-    address::{create2_preimage, create3_address, create2_address, create_address},
+    address::{create_address, create2_address, create2_preimage, create3_address},
     keccak256,
     secp256k1::Point,
 };
@@ -93,7 +93,13 @@ impl SaltConfig {
             _ => {}
         }
 
-        let mut cfg = Self { mode, deployer, code_hash, base_salt, mint_for };
+        let mut cfg = Self {
+            mode,
+            deployer,
+            code_hash,
+            base_salt,
+            mint_for,
+        };
         if let Some(account) = cfg.mint_for {
             // Pin the low half so the deployer's own salt derivation matches.
             let digest = keccak256(&account);
@@ -280,8 +286,14 @@ mod tests {
     fn nft_requires_a_caller_and_others_reject_one() {
         let deployer = [0u8; 20];
         assert!(
-            SaltConfig::new(MineMode::Nft, deployer, DEFAULT_PROXY_CODE_HASH, [0; 32], None)
-                .is_err()
+            SaltConfig::new(
+                MineMode::Nft,
+                deployer,
+                DEFAULT_PROXY_CODE_HASH,
+                [0; 32],
+                None
+            )
+            .is_err()
         );
         assert!(
             SaltConfig::new(

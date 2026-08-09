@@ -55,7 +55,12 @@ fn planted_target(mut backend: Box<dyn Backend>, mode: MineMode, round_size: usi
         mode: ModeConfig::Salt(cfg),
         score: ScoreSpec::matching(&hex::encode(target_address)).unwrap(),
         keccak: KeccakVariant::Tuned,
-        tuning: Tuning { round_size, work_size: 64, no_cache: true, ..Tuning::default() },
+        tuning: Tuning {
+            round_size,
+            work_size: 64,
+            no_cache: true,
+            ..Tuning::default()
+        },
         duration: Some(Duration::from_secs(30)),
         verify: true,
         exact_score: None,
@@ -80,7 +85,14 @@ fn planted_target(mut backend: Box<dyn Backend>, mode: MineMode, round_size: usi
     }
 
     backend
-        .run(&job, &mut Watch { inner: &collector, found: &found }, &stop)
+        .run(
+            &job,
+            &mut Watch {
+                inner: &collector,
+                found: &found,
+            },
+            &stop,
+        )
         .expect("backend run failed");
 
     let hits = collector.hits.lock().unwrap();
@@ -90,10 +102,29 @@ fn planted_target(mut backend: Box<dyn Backend>, mode: MineMode, round_size: usi
         .unwrap_or_else(|| panic!("{} backend reported no hits at all", mode.as_str()))
         .clone();
 
-    assert_eq!(best.score, 20, "{}: planted target not reached", mode.as_str());
-    assert_eq!(best.address, target_address, "{}: wrong address", mode.as_str());
-    assert_eq!(best.salt, Some(target_salt), "{}: wrong salt", mode.as_str());
-    assert!(best.verified, "{}: hit failed CPU re-derivation", mode.as_str());
+    assert_eq!(
+        best.score,
+        20,
+        "{}: planted target not reached",
+        mode.as_str()
+    );
+    assert_eq!(
+        best.address,
+        target_address,
+        "{}: wrong address",
+        mode.as_str()
+    );
+    assert_eq!(
+        best.salt,
+        Some(target_salt),
+        "{}: wrong salt",
+        mode.as_str()
+    );
+    assert!(
+        best.verified,
+        "{}: hit failed CPU re-derivation",
+        mode.as_str()
+    );
     best
 }
 
@@ -130,7 +161,12 @@ fn exact_mode_reports_repeated_full_matches() {
         mode: ModeConfig::Salt(cfg.clone()),
         score: spec,
         keccak: KeccakVariant::Tuned,
-        tuning: Tuning { round_size: 1 << 12, work_size: 64, no_cache: true, ..Tuning::default() },
+        tuning: Tuning {
+            round_size: 1 << 12,
+            work_size: 64,
+            no_cache: true,
+            ..Tuning::default()
+        },
         duration: Some(Duration::from_secs(3)),
         verify: true,
         exact_score: Some(needed),
@@ -141,7 +177,9 @@ fn exact_mode_reports_repeated_full_matches() {
     let collector = Collector::default();
     let stop = || false;
     let mut backend = CpuBackend::new(Some(2));
-    backend.run(&job, &mut &collector, &stop).expect("run failed");
+    backend
+        .run(&job, &mut &collector, &stop)
+        .expect("run failed");
 
     let hits = collector.hits.lock().unwrap();
     assert!(
@@ -167,7 +205,12 @@ fn ordinary_scoring_reports_only_improvements() {
         mode: ModeConfig::Salt(cfg),
         score: ScoreSpec::zeros(),
         keccak: KeccakVariant::Tuned,
-        tuning: Tuning { round_size: 1 << 12, work_size: 64, no_cache: true, ..Tuning::default() },
+        tuning: Tuning {
+            round_size: 1 << 12,
+            work_size: 64,
+            no_cache: true,
+            ..Tuning::default()
+        },
         duration: Some(Duration::from_secs(2)),
         verify: true,
         exact_score: None,
@@ -176,7 +219,9 @@ fn ordinary_scoring_reports_only_improvements() {
     let collector = Collector::default();
     let stop = || false;
     let mut backend = CpuBackend::new(Some(2));
-    backend.run(&job, &mut &collector, &stop).expect("run failed");
+    backend
+        .run(&job, &mut &collector, &stop)
+        .expect("run failed");
 
     let hits = collector.hits.lock().unwrap();
     let mut previous = 0;
@@ -220,7 +265,9 @@ mod opencl {
         let target = cfg.address_for_salt(&target_salt);
 
         for keccak in KeccakVariant::all() {
-            let Ok(mut b) = SaltBackend::new(&[]) else { return };
+            let Ok(mut b) = SaltBackend::new(&[]) else {
+                return;
+            };
             let job = Job {
                 mode: ModeConfig::Salt(cfg.clone()),
                 score: ScoreSpec::matching(&hex::encode(target)).unwrap(),
@@ -252,8 +299,15 @@ mod opencl {
                 fn on_speed(&mut self, _t: f64, _p: &[f64]) {}
             }
             let stop = || found.load(Ordering::SeqCst);
-            b.run(&job, &mut Watch { inner: &collector, found: &found }, &stop)
-                .expect("run failed");
+            b.run(
+                &job,
+                &mut Watch {
+                    inner: &collector,
+                    found: &found,
+                },
+                &stop,
+            )
+            .expect("run failed");
 
             let hits = collector.hits.lock().unwrap();
             let best = hits.iter().max_by_key(|h| h.score).expect("no hits");

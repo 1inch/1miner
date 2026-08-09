@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use miner_backend::{Backend, Job, Tuning};
-use miner_core::{Address, Hash, MineMode, ModeConfig, ProfanityConfig, SaltConfig, Salt};
+use miner_core::{Address, Hash, MineMode, ModeConfig, ProfanityConfig, Salt, SaltConfig};
 use rand::RngCore;
 
 use cli::{Cli, Command, CommonArgs, Scoring, ScoringArgs};
@@ -59,8 +59,7 @@ fn main() -> anyhow::Result<()> {
         Command::Nft(args) => {
             let score = args.scoring.resolve()?;
             let benchmark = args.scoring.is_benchmark();
-            let deployer =
-                cli::resolve_deployer(args.deployer.as_ref(), MineMode::Nft, benchmark)?;
+            let deployer = cli::resolve_deployer(args.deployer.as_ref(), MineMode::Nft, benchmark)?;
             let caller = match args.mint_for.as_ref() {
                 Some(s) => miner_core::parse_address(s)?,
                 None if benchmark => [0u8; 20],
@@ -155,7 +154,9 @@ fn open_backend(
     tuning: &Tuning,
 ) -> anyhow::Result<Box<dyn Backend>> {
     match common.backend.as_str() {
-        "cpu" => Ok(Box::new(miner_backend::cpu::CpuBackend::new(common.threads))),
+        "cpu" => Ok(Box::new(miner_backend::cpu::CpuBackend::new(
+            common.threads,
+        ))),
         "metal" => {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             {
