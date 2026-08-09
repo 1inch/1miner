@@ -8,14 +8,15 @@
 //! GPU-dependent tests skip rather than fail when no device is present, so the
 //! suite still runs in CI and in a container without a GPU.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use miner_backend::{Backend, Hit, Job, KeccakVariant, Reporter, Tuning, cpu::CpuBackend};
 use miner_core::{
-    DEFAULT_PROXY_CODE_HASH, MineMode, ModeConfig, SaltConfig, ScoreSpec, keccak256, nft_salt,
-    parse_address,
+    DEFAULT_PROXY_CODE_HASH, MineMode, ModeConfig, ProfanityConfig, SaltConfig, ScoreSpec,
+    keccak256, nft_salt, parse_address, secp256k1::generator,
 };
 
 #[derive(Default)]
@@ -197,6 +198,48 @@ fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize) {
 #[test]
 fn exact_mode_reports_repeated_full_matches() {
     exact_matches(Box::new(CpuBackend::new(Some(2))), 1 << 12);
+}
+
+/// The CPU profanity loop reports each hit as it finds it, so every hit has to
+/// arrive exactly once. Re-reporting the newest one on each speed poll — which
+/// is what passing `len - 1` to a drain does — shows up here as a repeated
+/// offset and a score that stops climbing.
+#[test]
+fn cpu_profanity_reports_each_hit_once() {
+    let job = Job {
+        mode: ModeConfig::Profanity(ProfanityConfig {
+            seed_public_key: generator(),
+            contract: false,
+        }),
+        score: ScoreSpec::zeros(),
+        keccak: KeccakVariant::Tuned,
+        tuning: Tuning::default(),
+        duration: Some(Duration::from_secs(2)),
+        verify: true,
+        exact_score: None,
+    };
+
+    let collector = Collector::default();
+    let stop = || false;
+    let mut backend = CpuBackend::new(Some(1));
+    backend
+        .run(&job, &mut &collector, &stop)
+        .expect("run failed");
+
+    let hits = collector.hits.lock().unwrap();
+    assert!(!hits.is_empty(), "no hits, so nothing here was checked");
+
+    let mut previous = 0;
+    let mut offsets = HashSet::new();
+    for hit in hits.iter() {
+        assert!(
+            hit.score > previous,
+            "profanity scores must strictly improve"
+        );
+        previous = hit.score;
+        let offset = hit.offset.expect("a profanity hit carries an offset");
+        assert!(offsets.insert(offset), "an offset was reported twice");
+    }
 }
 
 /// Without `--exact` the bar climbs, so each reported score is strictly better

@@ -166,7 +166,6 @@ impl CpuBackend {
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<()> {
         let counter = AtomicU64::new(0);
-        let hits: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
         let start = Instant::now();
         let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
 
@@ -190,7 +189,11 @@ impl CpuBackend {
                 }
                 let mut bytes = [0u8; 32];
                 bytes[24..].copy_from_slice(&offset.to_be_bytes());
-                hits.lock().unwrap().push(Hit {
+                // Straight out, rather than into a collection for the speed
+                // poll to drain the way run_salt needs: this loop is
+                // single-threaded, and draining every 512 steps kept only
+                // whichever hit was newest.
+                reporter.on_hit(&Hit {
                     score: value,
                     address,
                     salt: None,
@@ -203,8 +206,6 @@ impl CpuBackend {
 
             counter.fetch_add(1, Ordering::Relaxed);
             if offset % 512 == 0 {
-                let reported = hits.lock().unwrap().len();
-                drain(&hits, reported.saturating_sub(1), reporter);
                 meter.sample(counter.load(Ordering::Relaxed));
                 let rate = meter.rate();
                 reporter.on_speed(rate, &[rate]);
