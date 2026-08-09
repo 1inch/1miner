@@ -170,7 +170,13 @@ fn open_backend(
                 Ok(Box::new(miner_backend::metal::MetalBackend::new()?))
             }
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
-            anyhow::bail!("metal is only available on macOS builds compiled with --features metal")
+            {
+                // Only the arm above reads it, and that arm is compiled out here.
+                let _ = mode;
+                anyhow::bail!(
+                    "metal is only available on macOS builds compiled with --features metal"
+                )
+            }
         }
         "opencl" => {
             #[cfg(feature = "opencl")]
@@ -187,7 +193,13 @@ fn open_backend(
                 )?))
             }
             #[cfg(not(feature = "opencl"))]
-            anyhow::bail!("this build was compiled without the opencl feature")
+            {
+                // As above: a CPU-only build reads neither, and leaving them
+                // unmentioned is what made `-D warnings` unreachable for this
+                // feature set.
+                let _ = (mode, tuning);
+                anyhow::bail!("this build was compiled without the opencl feature")
+            }
         }
         other => anyhow::bail!("unknown backend {other}"),
     }

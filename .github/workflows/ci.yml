@@ -1,0 +1,129 @@
+name: ci
+
+# The suite is the whole argument of this project: every failure in address
+# mining is silent, so only asserted agreement catches one. Until this workflow
+# existed the assertions were never run anywhere automatic.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the registry, not target/. Cargo decides staleness partly on
+      # mtimes, which a restored directory does not preserve faithfully — the
+      # Dockerfile already carries a `touch` to work around exactly that, and a
+      # cache that silently reuses a stale artefact is worse here than a slow
+      # build.
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - run: cargo fmt --all --check
+
+      # opencl3 needs these to type-check the default feature set. No driver and
+      # no device are involved.
+      - name: Install the OpenCL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends opencl-headers ocl-icd-opencl-dev
+
+      # The lints live in the workspace manifest; this only promotes them to
+      # errors.
+      - name: Clippy, default features
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The portable CPU build is a documented configuration, and it is where a
+      # warning survived longest, because nothing ever built it.
+      - name: Clippy, CPU only
+        run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A macOS-only failure is worth seeing even once Linux is already red.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux, opencl
+            os: ubuntu-latest
+            features: ''
+          - name: macos, opencl and metal
+            os: macos-latest
+            features: '--features metal'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install the OpenCL headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends opencl-headers ocl-icd-opencl-dev
+
+      # Neither runner is promised a usable GPU, and the device-dependent tests
+      # skip rather than fail when enumerate_devices or
+      # MTLCreateSystemDefaultDevice comes up empty, so the suite is green
+      # without one. `--nocapture` is what puts those skips in the log, since
+      # cargo swallows the output of a passing test.
+      #
+      # pipefail matters: without it `tee` supplies the exit code and a failing
+      # suite reports success. That is the same shape as the MINER_OUTPUT bug the
+      # entrypoint already had.
+      - name: Test
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked ${{ matrix.features }} -- --nocapture 2>&1 | tee test.log
+
+      # A green suite that touched no GPU should say so out loud, because a fast
+      # wrong kernel is the failure this project is arranged to prevent.
+      - name: Say whether a GPU was exercised
+        if: always()
+        run: |
+          if grep -i 'skipping' test.log; then
+            echo "### Some device-dependent tests skipped: no GPU on this runner" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Every device-dependent test ran: a GPU was present" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  cpu-only:
+    name: build without a GPU backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # No OpenCL headers on purpose. This is what a packager or an unsupported
+      # platform gets, and it has to keep building without them.
+      - run: cargo test --workspace --locked --no-default-features

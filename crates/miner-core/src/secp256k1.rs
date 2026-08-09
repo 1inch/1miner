@@ -490,6 +490,30 @@ mod tests {
         }
     }
 
+    /// The same table, pinned in a way that cannot skip. `references/` is
+    /// gitignored, so the cross-check above is vacuous on a fresh clone and in
+    /// every container build — which is everywhere except a developer's own
+    /// machine. This digest was recorded here, where that cross-check passes, so
+    /// it inherits its authority; what it adds is regression detection that runs
+    /// unconditionally.
+    ///
+    /// A digest cannot replace the cross-check: it pins the table against
+    /// itself, not against profanity2. Recompute it only after the cross-check
+    /// has passed against the reference tree.
+    #[test]
+    fn generator_table_digest_is_pinned() {
+        let mut bytes = Vec::with_capacity(8160 * 64);
+        for point in generator_table() {
+            let (x, y) = point.to_bytes();
+            bytes.extend_from_slice(&x);
+            bytes.extend_from_slice(&y);
+        }
+        assert_eq!(
+            hex::encode(crate::keccak256(&bytes)),
+            "4003072db7dc32261687856a7630945f1ec81babd0468846d6d022ebe8ed74ee"
+        );
+    }
+
     #[test]
     fn generator_table_shape_and_first_entries() {
         let table = generator_table();

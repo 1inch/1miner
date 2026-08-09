@@ -24,6 +24,8 @@ cargo build --release                     # OpenCL, the default feature
 cargo build --release --features metal    # plus Metal, macOS only
 cargo test                                # add --features metal on macOS
 cargo test --test derivation              # cross-backend agreement tests
+cargo fmt --all --check                   # CI runs this, so run it before pushing
+cargo clippy --workspace --all-targets -- -D warnings
 ./target/release/1miner self-test         # check the device actually present
 scripts/bench.sh -b "opencl metal"        # see docs/benchmarking.md before quoting a number
 ```
@@ -52,7 +54,8 @@ Every failure mode here is silent: a wrong pad byte or the wrong nonce still pro
 
 - `thiserror` for library errors (`CoreError`, `BackendError`), `anyhow` in the CLI. Messages are lowercase and say what to do instead of what went wrong.
 - Comments explain why: a reference implementation's quirk, a measured result, a trap already fallen into. They never narrate the code. Module-level `//!` docs carry the module's place in the correctness story — keep them current.
-- **Do not run `cargo fmt` across the tree.** It is not clean under default rustfmt nor under `use_small_heuristics=Max`, so a blanket format buries the real change in churn. Format what you touch and match the surrounding lines.
+- Stock rustfmt, and `rustfmt.toml` sets only `newline_style`. Run `cargo fmt` before committing; CI checks it. Do not add style options to that file — a contributor's editor formats on save with defaults, and a setting it does not know about turns their pull request into someone else's churn.
+- Lints live in `[workspace.lints]` in the root `Cargo.toml`, and each crate opts in with `[lints] workspace = true`. The list is short so that `-D warnings` is a gate rather than noise; the manifest records why `cast_possible_truncation` and `cast_lossless` are deliberately absent. Every unsafe block carries a `// SAFETY:` comment and `undocumented_unsafe_blocks` keeps it that way.
 
 ## Documentation conventions
 
@@ -76,4 +79,6 @@ Compiled OpenCL kernels are cached under `$XDG_CACHE_HOME/1miner/opencl`, keyed 
 
 ## CI
 
-`.github/workflows/docker.yml` builds the image and smoke-tests it without a GPU on every push and pull request, but publishes to GHCR only when the version the binary reports is not in the registry yet. Bump `workspace.package.version` to release: a commit to `main` on its own no longer publishes anything, and a `v*` tag that disagrees with that version fails the build. No workflow runs `cargo test` yet.
+`.github/workflows/ci.yml` runs the suite, `cargo fmt --all --check` and clippy under `-D warnings`, on Linux with the default features and on macOS with Metal as well, plus a CPU-only build with no OpenCL headers installed at all. Neither runner is promised a GPU, so the job says in its summary whether any device-dependent test skipped — a green suite that verified nothing on hardware should not look like one that did.
+
+`.github/workflows/docker.yml` builds the image and smoke-tests it without a GPU on every push and pull request, but publishes to GHCR only when the version the binary reports is not in the registry yet. Bump `workspace.package.version` to release: a commit to `main` on its own no longer publishes anything, and a `v*` tag that disagrees with that version fails the build.
