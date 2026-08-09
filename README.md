@@ -63,15 +63,14 @@ CREATE3 runs at about half of CREATE2 because it hashes twice: CREATE2 for the p
 
 ## Docker
 
-Kernels are embedded in the binary, so the image needs no files beside it.
+A prebuilt image with the OpenCL runtime is available, so nothing has to be installed on the machine that does the searching:
 
 ```bash
-docker build -t 1miner .
-docker run --rm --gpus all 1miner self-test
-docker run --rm --gpus all 1miner create3 --deployer 0xFactory --leading 0
+docker run --rm --gpus all ghcr.io/1inch/1miner:latest self-test
+docker run --rm --gpus all ghcr.io/1inch/1miner:latest create3 --deployer 0xFactory --leading 0
 ```
 
-For rented GPUs see [docs/vastai.md](docs/vastai.md).
+Kernels are embedded in the binary, so the image needs no files beside it. For rented GPUs see [docs/vastai.md](docs/vastai.md).
 
 ## Documentation
 

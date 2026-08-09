@@ -1,9 +1,17 @@
 # Docker
 
+A prebuilt image is published to GHCR from [`.github/workflows/docker.yml`](../.github/workflows/docker.yml) on every push to `main` and on `v*` tags:
+
+```bash
+docker run --rm --gpus all ghcr.io/1inch/1miner:latest self-test
+docker run --rm --gpus all ghcr.io/1inch/1miner:latest create3 --deployer 0xFactory --leading 0
+```
+
+To build locally:
+
 ```bash
 docker build -t 1miner .
 docker run --rm --gpus all 1miner self-test
-docker run --rm --gpus all 1miner create3 --deployer 0xFactory --leading 0
 ```
 
 The image is a multi-stage build: Rust on Debian bookworm to compile, then a `debian:bookworm-slim` runtime carrying only the ICD loader, `clinfo` and the binary. It comes out around 150 MB.

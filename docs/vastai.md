@@ -4,7 +4,7 @@ The [Dockerfile](../Dockerfile) in the repository root builds an image with the 
 
 Unlike profanity2, the kernels are compiled into the binary, so there are no `.cl` files to keep beside it and no working-directory requirement.
 
-There is no published image yet, so [build and push your own](#building-and-pushing-the-image) first. It works on any Docker host with an NVIDIA GPU; vast.ai is just the cheapest way to rent one.
+The image is published as `ghcr.io/1inch/1miner` (see [Building and pushing the image](#building-and-pushing-the-image) if you prefer your own registry). It works on any Docker host with an NVIDIA GPU; vast.ai is just the cheapest way to rent one.
 
 ## Why this is safe on someone else's machine
 
@@ -18,7 +18,7 @@ The salt modes never involve a key at all. The worst a hostile host could do is 
 
    | Field | Value |
    |---|---|
-   | Image Path:Tag | `ghcr.io/YOUR_USER/1miner:latest` |
+   | Image Path:Tag | `ghcr.io/1inch/1miner:latest` |
    | Launch Mode | **docker ENTRYPOINT** |
    | Arguments | `self-test` |
    | Disk Space | 12 GB (the image is about 150 MB, this is just the minimum) |
@@ -194,7 +194,9 @@ Runtime grows exponentially with the length of the pattern, so estimate before r
 
 ## Building and pushing the image
 
-A rented machine can only pull from a registry, so the image has to be pushed somewhere first — GHCR if you will use it more than once, ttl.sh for a single throwaway run.
+The official image is built and pushed by GitHub Actions (`.github/workflows/docker.yml`) on every push to `main` and on version tags. Use that unless you have local changes, need a revision that is not published yet, or would rather not depend on a registry someone else controls.
+
+A rented machine can only pull from a registry, so a custom image has to be pushed somewhere first — GHCR if you will use it more than once, ttl.sh for a single throwaway run.
 
 ```bash
 git clone https://github.com/1inch/1miner
@@ -214,7 +216,7 @@ docker tag 1miner ghcr.io/YOUR_USER/1miner:latest
 docker push ghcr.io/YOUR_USER/1miner:latest
 ```
 
-A package pushed to GHCR is **private by default**, so a rented machine cannot pull it yet. Either make it public once, under Packages on your GitHub profile, or hand the credentials to vast.ai:
+A package pushed to GHCR is **private by default**, so a rented machine cannot pull it yet. Either make it public once, under Packages on your GitHub profile (or the org), or hand the credentials to vast.ai:
 
 ```bash
 # public package
@@ -228,6 +230,13 @@ vastai create instance <OFFER_ID> --image ghcr.io/YOUR_USER/1miner:latest \
 ```
 
 In the GUI the same credentials go into the *Docker login* field of the template, next to the image path.
+
+For the published `ghcr.io/1inch/1miner` image the same applies once the package visibility is Public:
+
+```bash
+vastai create instance <OFFER_ID> --image ghcr.io/1inch/1miner:latest \
+    --disk 12 --args create3 --deployer 0xYourFactory --leading 0
+```
 
 ### ttl.sh
 
