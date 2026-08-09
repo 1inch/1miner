@@ -107,5 +107,8 @@ base salt forces a rebuild, because the pre-image is a `-D` define.
 
 ## CI
 
-`.github/workflows/docker.yml` builds the image, smoke-tests it without a GPU and pushes to
-GHCR from `main` and tags. No workflow runs `cargo test` yet.
+`.github/workflows/docker.yml` builds the image and smoke-tests it without a GPU on every push
+and pull request, but publishes to GHCR only when the version the binary reports is not in the
+registry yet. Bump `workspace.package.version` to release: a commit to `main` on its own no
+longer publishes anything, and a `v*` tag that disagrees with that version fails the build. No
+workflow runs `cargo test` yet.

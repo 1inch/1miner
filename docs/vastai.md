@@ -194,7 +194,7 @@ Runtime grows exponentially with the length of the pattern, so estimate before r
 
 ## Building and pushing the image
 
-The official image is built and pushed by GitHub Actions (`.github/workflows/docker.yml`) on every push to `main` and on version tags. Use that unless you have local changes, need a revision that is not published yet, or would rather not depend on a registry someone else controls.
+The official image is built and pushed by GitHub Actions (`.github/workflows/docker.yml`) whenever the workspace version in `Cargo.toml` changes, so `:latest` is the last released version rather than the last commit to `main`. Use that unless you have local changes, need a revision that is not published yet, or would rather not depend on a registry someone else controls.
 
 A rented machine can only pull from a registry, so a custom image has to be pushed somewhere first — GHCR if you will use it more than once, ttl.sh for a single throwaway run.
 

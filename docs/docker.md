@@ -1,11 +1,13 @@
 # Docker
 
-A prebuilt image is published to GHCR from [`.github/workflows/docker.yml`](../.github/workflows/docker.yml) on every push to `main` and on `v*` tags:
+A prebuilt image is published to GHCR by [`.github/workflows/docker.yml`](../.github/workflows/docker.yml):
 
 ```bash
 docker run --rm --gpus all ghcr.io/1inch/1miner:latest self-test
 docker run --rm --gpus all ghcr.io/1inch/1miner:latest create3 --deployer 0xFactory --leading 0
 ```
+
+Publishing is keyed on the version rather than on the commit. Every push to `main` builds the image and smoke-tests it, but it reaches the registry only when the workspace `version` in `Cargo.toml` is not in GHCR already: bumping `0.1.0` to `0.1.1` publishes `0.1.1`, `0.1` and `latest`, and the commits that follow at `0.1.1` publish nothing. So `:latest` tracks the last released version, not the tip of `main`. See [Releasing](#releasing).
 
 To build locally:
 
@@ -83,3 +85,18 @@ All visible devices are used, one thread each. Restrict with either Docker or 1m
 docker run --rm --gpus '"device=0,1"' 1miner create3 --deployer 0x... --leading 0
 docker run --rm --gpus all 1miner create3 --deployer 0x... --leading 0 --skip 2 --skip 3
 ```
+
+## Releasing
+
+Publishing keys on the version, so a release is a version bump and nothing else:
+
+```bash
+# Cargo.toml, [workspace.package]: version = "0.1.0"  ->  "0.1.1"
+cargo update --workspace
+cargo test
+git commit -am "1miner 0.1.1" && git push
+```
+
+`cargo update --workspace` is not optional. `Cargo.lock` records the versions of the workspace's own crates, and the Dockerfile builds with `--locked`, so a lock file left at the old version fails the image build with `cannot update the lock file ... because --locked was passed`.
+
+The workflow reads the version back out of the built binary's `--version`, asks GHCR whether that tag exists and pushes `0.1.1`, `0.1` and `latest` if it does not. A `v*` git tag is optional and grants nothing extra; one whose number disagrees with the binary fails the build rather than publishing an image whose name and contents differ. To republish a version after a change that does not touch the Rust code — the Dockerfile or the entrypoint — run the workflow by hand with `republish` set.

@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      republish:
+        description: Push even when this version is already in the registry
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -41,6 +46,33 @@ jobs:
             --deployer 0x0000000000000000000000000000000000000001 \
             --leading 0
 
+      - name: Read the version out of the image
+        id: version
+        run: |
+          # The binary's own --version rather than Cargo.toml, so the tag names
+          # what is inside the image instead of what the checkout claims.
+          version=$(docker run --rm 1miner:ci --version | awk 'END { print $NF }')
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "no version in the image's --version output: '$version'" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the tag agrees with the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A tag that disagrees publishes an image whose name and contents
+          # differ, and nothing downstream would say so.
+          tag=${GITHUB_REF#refs/tags/v}
+          if [ "$tag" != "$VERSION" ]; then
+            echo "tag v$tag does not match the built version $VERSION" >&2
+            echo "match the workspace version in Cargo.toml to the tag, or move the tag" >&2
+            exit 1
+          fi
+
       - name: Log in to the container registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -49,21 +81,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Collect image tags
+      - name: Decide whether this version needs publishing
         if: github.event_name != 'pull_request'
+        id: decide
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPUBLISH: ${{ github.event.inputs.republish }}
+        run: |
+          image=$(echo "$REGISTRY/$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          # Ask the registry rather than diff Cargo.toml against the previous
+          # commit: a push that failed, or a bump that arrived inside a merge,
+          # then still publishes on the next run instead of being skipped for
+          # good.
+          if [ "$REPUBLISH" = "true" ]; then
+            publish=true
+            reason="publishing $image:$VERSION again, as requested"
+          elif docker buildx imagetools inspect "$image:$VERSION" >/dev/null 2>&1; then
+            publish=false
+            reason="not published: $image:$VERSION already exists. Bump the workspace version in Cargo.toml to release."
+          else
+            publish=true
+            reason="publishing $image:$VERSION"
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "$reason"
+          echo "$reason" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect image tags
+        if: steps.decide.outputs.publish == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.decide.outputs.image }}
+          # No branch or sha tags: a push only happens when the version changed,
+          # so a per-commit tag would be a second name for the release digest.
+          # The commit is on the image as an OCI revision label either way.
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.minor }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Push image
-        if: github.event_name != 'pull_request'
+        if: steps.decide.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
