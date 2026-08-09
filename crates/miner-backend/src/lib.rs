@@ -6,6 +6,7 @@
 
 pub mod cpu;
 pub mod kernels;
+pub mod speed;
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
@@ -93,6 +94,9 @@ pub struct Tuning {
     pub inverse_multiple: usize,
     pub skip_devices: Vec<usize>,
     pub no_cache: bool,
+    /// Excluded from the measured summary, so a benchmark figure does not
+    /// include kernel compilation and the first slow round.
+    pub warmup: Duration,
 }
 
 impl Default for Tuning {
@@ -105,6 +109,7 @@ impl Default for Tuning {
             inverse_multiple: 16_384,
             skip_devices: Vec::new(),
             no_cache: false,
+            warmup: Duration::ZERO,
         }
     }
 }
@@ -166,11 +171,14 @@ pub struct Hit {
     pub verified: bool,
 }
 
-/// Progress callbacks. Both are invoked from the run loop.
+/// Progress callbacks, invoked from the run loop.
 pub trait Reporter: Send {
     fn on_hit(&mut self, hit: &Hit);
-    /// Aggregate hashrate in hashes per second.
+    /// Aggregate hashrate over the recent window, in hashes per second.
     fn on_speed(&mut self, total: f64, per_device: &[f64]);
+    /// The post-warmup average, reported once when the run ends. This is the
+    /// figure a benchmark should quote, since the live rate is a short window.
+    fn on_summary(&mut self, _summary: &crate::speed::SpeedSummary) {}
 }
 
 #[derive(Debug, Clone)]

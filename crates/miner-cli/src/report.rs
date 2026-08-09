@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::time::Instant;
 
+use miner_backend::speed::SpeedSummary;
 use miner_backend::{Hit, Reporter};
 use miner_core::{MineMode, to_checksum_address};
 
@@ -58,6 +59,19 @@ impl Reporter for TerminalReporter {
             hit.score,
             hit.device_index,
             to_checksum_address(&hit.address),
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    /// The figure to quote. `on_speed` is a short rolling window, so it moves
+    /// around; this is the average over everything after the warmup.
+    fn on_summary(&mut self, summary: &SpeedSummary) {
+        print!("{CLEAR_LINE}");
+        println!(
+            "Measured: {:.3} MH/s over {:.1}s ({} hashes)",
+            summary.rate / 1.0e6,
+            summary.elapsed.as_secs_f64(),
+            summary.hashes,
         );
         let _ = std::io::stdout().flush();
     }

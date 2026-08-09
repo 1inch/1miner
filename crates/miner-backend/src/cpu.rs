@@ -15,6 +15,7 @@ use miner_core::{
     secp256k1::{Point, generator, point_add},
 };
 
+use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
 use crate::{Backend, DeviceInfo, Hit, Job, Reporter, Result};
 
 pub struct CpuBackend {
@@ -167,6 +168,7 @@ impl CpuBackend {
         let counter = AtomicU64::new(0);
         let hits: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
         let start = Instant::now();
+        let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
 
         let g = generator();
         let mut point: Point = cfg.seed_public_key;
@@ -203,14 +205,15 @@ impl CpuBackend {
             if offset % 512 == 0 {
                 let reported = hits.lock().unwrap().len();
                 drain(&hits, reported.saturating_sub(1), reporter);
-                let elapsed = start.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    let rate = counter.load(Ordering::Relaxed) as f64 / elapsed;
-                    reporter.on_speed(rate, &[rate]);
-                }
+                meter.sample(counter.load(Ordering::Relaxed));
+                let rate = meter.rate();
+                reporter.on_speed(rate, &[rate]);
             }
         }
 
+        if let Some(summary) = meter.summary() {
+            reporter.on_summary(&summary);
+        }
         Ok(())
     }
 }
@@ -256,17 +259,20 @@ fn poll(
     reporter: &mut dyn Reporter,
     should_stop: &(dyn Fn() -> bool + Sync),
 ) -> usize {
+    let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
     loop {
         std::thread::sleep(Duration::from_millis(250));
         reported = drain(hits, reported, reporter);
 
-        let elapsed = start.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            let rate = counter.load(Ordering::Relaxed) as f64 / elapsed;
-            reporter.on_speed(rate, &[rate]);
-        }
+        meter.sample(counter.load(Ordering::Relaxed));
+        let rate = meter.rate();
+        reporter.on_speed(rate, &[rate]);
 
         if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
+            // The meter lives here, so the summary has to be reported here too.
+            if let Some(summary) = meter.summary() {
+                reporter.on_summary(&summary);
+            }
             return reported;
         }
     }

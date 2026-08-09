@@ -21,6 +21,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
+use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
 use crate::{Backend, BackendError, DeviceInfo, Hit, Job, Reporter, Result};
 
 pub const MAX_SCORE: usize = 40;
@@ -141,6 +142,7 @@ impl MetalBackend {
             .max(1);
 
         let start = Instant::now();
+        let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
         let mut round: u32 = 0;
         let mut best: u32 = job.initial_threshold();
         let mut hashes: u64 = 0;
@@ -204,13 +206,14 @@ impl MetalBackend {
                 reporter.on_hit(&hit);
             }
 
-            let elapsed = start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                let rate = hashes as f64 / elapsed;
-                reporter.on_speed(rate, &[rate]);
-            }
+            meter.sample(hashes);
+            let rate = meter.rate();
+            reporter.on_speed(rate, &[rate]);
         }
 
+        if let Some(summary) = meter.summary() {
+            reporter.on_summary(&summary);
+        }
         Ok(())
     }
 }

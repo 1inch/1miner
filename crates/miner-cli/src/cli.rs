@@ -225,6 +225,11 @@ pub struct CommonArgs {
     #[arg(long)]
     pub seconds: Option<u64>,
 
+    /// Exclude this many seconds from the measured summary, so a benchmark
+    /// figure is not diluted by kernel compilation and the first slow round.
+    #[arg(long, default_value_t = 0)]
+    pub warmup: u64,
+
     /// Number of CPU worker threads, for --backend cpu.
     #[arg(long)]
     pub threads: Option<usize>,
@@ -240,6 +245,7 @@ impl CommonArgs {
             inverse_multiple: self.inverse_multiple,
             skip_devices: self.skip.clone(),
             no_cache: self.no_cache,
+            warmup: std::time::Duration::from_secs(self.warmup),
         }
     }
 

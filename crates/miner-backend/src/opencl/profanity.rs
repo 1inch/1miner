@@ -23,6 +23,7 @@ use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
 
 use super::{DeviceId, build_program, cl_err, enumerate_devices};
+use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
     Backend, BackendError, DeviceInfo, Hit, Job, KeccakVariant, Reporter, Result, kernels,
 };
@@ -202,6 +203,10 @@ fn run_profanity(
     let failure: Mutex<Option<BackendError>> = Mutex::new(None);
     let start = Instant::now();
     let mut reported = 0usize;
+    let mut meters: Vec<SpeedMeter> = ids
+        .iter()
+        .map(|_| SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup))
+        .collect();
 
     std::thread::scope(|scope| {
         for (slot, (device_id, info)) in ids.iter().zip(infos).enumerate() {
@@ -237,14 +242,11 @@ fn run_profanity(
             std::thread::sleep(Duration::from_millis(250));
             reported = drain_hits(&hits, reported, reporter);
 
-            let elapsed = start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                let per_device: Vec<f64> = counters
-                    .iter()
-                    .map(|c| c.load(Ordering::Relaxed) as f64 / elapsed)
-                    .collect();
-                reporter.on_speed(per_device.iter().sum(), &per_device);
+            for (meter, counter) in meters.iter_mut().zip(counters.iter()) {
+                meter.sample(counter.load(Ordering::Relaxed));
             }
+            let per_device: Vec<f64> = meters.iter().map(SpeedMeter::rate).collect();
+            reporter.on_speed(per_device.iter().sum(), &per_device);
 
             let expired = job.duration.is_some_and(|d| start.elapsed() >= d);
             if expired || should_stop() || failure.lock().unwrap().is_some() {
@@ -254,6 +256,11 @@ fn run_profanity(
     });
 
     drain_hits(&hits, reported, reporter);
+    let summaries: Vec<_> = meters.iter().map(SpeedMeter::summary).collect();
+    if let Some(total) = combine(&summaries) {
+        reporter.on_summary(&total);
+    }
+
     match failure.into_inner().unwrap() {
         Some(e) => Err(e),
         None => Ok(()),

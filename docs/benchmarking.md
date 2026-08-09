@@ -30,28 +30,42 @@ scripts/bench.sh -m create2 -b "opencl metal" -o bench-results.md
 What it does, and what to reproduce if you measure by hand:
 
 - **Cools down before every run.** `-c`, default 30 seconds idle.
-- **Warms up inside every run.** `-w`, default 10 seconds discarded, then `-d` seconds measured, so start-up and kernel compilation are excluded.
+- **Excludes a warmup from the figure.** `-w`, default 10 seconds, is passed to the miner as `--warmup`, and the script reads the `Measured:` line the miner prints when it stops. That line is the average over everything after the warmup, so kernel compilation and the first slow round are genuinely left out rather than merely diluted.
 - **Alternates the order each pass.** Being second is a real penalty, so it must not always land on the same contender. If your means still depend on order, drift is dominating and the numbers are not yet meaningful.
 - **Repeats.** `-p`, default two passes, and it prints the min and max alongside the mean so you can see the spread rather than trusting a single figure.
-- **Warns if `self-test` fails** on the first backend, because a fast wrong kernel is the failure this project is arranged to prevent.
+- **Warns if** `self-test` **fails** on the first backend, because a fast wrong kernel is the failure this project is arranged to prevent.
 - **Records provenance** with `-o`: date, host, mode, backend and kernel, since an unlabelled hashrate is not reproducible across driver releases.
 
-A healthy result looks like this — note that reversing the order in pass 2 moved nothing:
+## Two numbers, and which one to quote
+
+While mining, the live line is a **rolling window** over the last few seconds. It settles within about a second and then tracks the current rate, so it is the number that shows a GPU throttling, and it reads zero if a device stops producing work.
+
+When the run ends, the miner prints one more line:
+
+```
+Measured: 356.101 MH/s over 20.0s (7147094528 hashes)
+```
+
+That is the average over everything after `--warmup`, and it is the figure to quote. Quoting the live line instead means quoting a short window, which moves around.
+
+Earlier versions of this project reported a cumulative average since the start of the run, which is worth knowing about because it was wrong in a specific direction: it crept upwards for tens of seconds as it slowly forgot the slow first round, understated every rate, and could never show throttling at all. Figures measured that way were low by a few percent for the salt modes and by about 12% for profanity, whose start-up initialises millions of points before any hashing begins.
+
+A healthy result looks like this — note that reversing the order in pass 2 moved nothing much:
 
 ```
 pass 1
-  opencl:tuned     352.864 MH/s
-  metal:tuned      367.690 MH/s
+  opencl:tuned     358.507 MH/s
+  metal:tuned      347.959 MH/s
 pass 2
-  metal:tuned      367.317 MH/s
-  opencl:tuned     353.847 MH/s
+  metal:tuned      356.421 MH/s
+  opencl:tuned     353.695 MH/s
 
 mean per contender:
-  opencl:tuned     353.356 MH/s (min 352.864, max 353.847)
-  metal:tuned      367.504 MH/s (min 367.317, max 367.690)
+  opencl:tuned     356.101 MH/s (min 353.695, max 358.507)
+  metal:tuned      352.190 MH/s (min 347.959, max 356.421)
 ```
 
-For reference, the Rust-versus-C++ gate produced 702.1 and 672.9 MH/s for the C++ binary against 712.7 and 696.4 for Rust on the identical kernel — a consistent downward drift across all four runs, with the two hosts otherwise indistinguishable.
+For reference, the Rust-versus-C++gate produced 702.1 and 672.9 MH/s for the C++ binary against 712.7 and 696.4 for Rust on the identical kernel — a consistent downward drift across all four runs, with the two hosts otherwise indistinguishable.
 
 ## Comparing kernels
 
@@ -65,23 +79,25 @@ Check agreement before you believe a speedup: `cargo test --test derivation` and
 
 Note the GPU, the driver or OS version, the backend, the kernel variant, the mode and the date. Hashrates move with driver releases, so an unlabelled number is not reproducible.
 
-Measured on an Apple M4 Max (40-core GPU), macOS 26.5, 20-second windows after a 10-second warmup, August 2026:
+Measured on an Apple M4 Max (40-core GPU), macOS 26.5, `scripts/bench.sh` with an 8-second warmup and a 20-second measured window, two passes in alternating order, August 2026. Each figure is the mean, with the spread in brackets:
 
-| Mode | Backend | Kernel | Speed |
-| --- | --- | --- | --- |
-| create2 | OpenCL | tuned | 722.6 MH/s |
-| create2 | Metal | built-in | 728.9 MH/s |
-| create3 | OpenCL | tuned | 358.6 MH/s |
-| create3 | OpenCL | plain | 346.6 MH/s |
-| create3 | Metal | built-in | 362.4 MH/s |
-| profanity | OpenCL | tuned | 338.9 MH/s (`-I 8192`) |
-| create3 | CPU, NEON | built-in | 88.7 MH/s (16 threads) |
-| create3 | CPU, scalar | built-in | 38.0 MH/s (`MINER_NO_NEON=1`) |
+| Mode      | Backend     | Kernel   | Speed                                        |
+| --------- | ----------- | -------- | -------------------------------------------- |
+| create2   | Metal       | built-in | 724.4 MH/s (720.6–728.1)                     |
+| create2   | OpenCL      | tuned    | 721.8 MH/s (715.9–727.6)                     |
+| profanity | OpenCL      | tuned    | 381.6 MH/s (378.8–384.5)                     |
+| create3   | OpenCL      | tuned    | 356.1 MH/s (353.7–358.5)                     |
+| create3   | Metal       | built-in | 352.2 MH/s (348.0–356.4)                     |
+| create3   | OpenCL      | plain    | 330.0 MH/s (324.8–335.2)                     |
+| create3   | CPU, NEON   | built-in | 87.3 MH/s (86.7–88.0, 16 threads)            |
+| create3   | CPU, scalar | built-in | 36.2 MH/s (36.1–36.2, `MINER_NO_NEON=1`)     |
 
-For comparison, the C++ references on the same machine: ERADICATE2 at about 733 MH/s for create2, ERADICATE3 at 357 MH/s for create3, profanity2 at 353 MH/s.
+For comparison, the C++ references on the same machine: ERADICATE2 at about 733 MH/s for create2, ERADICATE3 at 357 MH/s for create3, profanity2 at 353 MH/s. Those use a rolling window, so they were already honest figures.
 
-The tuned and plain OpenCL figures above were taken in the same session and are within the run-to-run spread, so treat them as equal on this hardware rather than as a 3% win.
+Three things the table says:
 
-The CPU rows show what the two-lane NEON Keccak buys on aarch64: 2.3x, for identical output. It is still far below the same machine's GPU, which is why the CPU backend is a reference and a fallback rather than a contender.
+**The tuned Keccak is worth about 7%** on create3, 356.1 against 330.0. An earlier measurement using the old cumulative averaging put the two within noise of each other and this page said to treat them as equal; that was the measurement's fault, not the kernels'. This is exactly the kind of difference selectable kernels exist to find, so measure on your own hardware rather than trusting either figure.
 
-One finding worth repeating: the first Metal kernel ran at 193 MH/s because its permutation used a scratch array with computed indices, which spilled to memory. Rewriting it with literal indices so all 25 lanes stay in registers took it to 362 MH/s for no change in output. If a kernel is unexpectedly slow, look at register spilling before anything else.
+**Metal and OpenCL are close on this machine**, with OpenCL marginally ahead on create3 and Metal marginally ahead on create2. The spreads overlap in both cases, so neither is a clear winner here. On Apple silicon that is a little surprising given OpenCL is deprecated, and it means the choice is worth measuring rather than assuming.
+
+**The two-lane NEON Keccak is worth 2.4x** on the CPU path, 87.3 against 36.2, for identical output. Still far below the same machine's GPU, which is why the CPU backend is a reference and a fallback rather than a contender.

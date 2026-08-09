@@ -48,16 +48,16 @@ No mode ever assumes a deployer address. A salt mined against the wrong deployer
 
 ## Performance
 
-Measured on an Apple M4 Max (40-core GPU), 20-second windows after warmup:
+Measured on an Apple M4 Max (40-core GPU) with `scripts/bench.sh`: 20-second windows after an 8-second warmup, two passes in alternating order.
 
 | Mode | Backend | Speed |
 | --- | --- | --- |
-| create2 | OpenCL | 722.6 MH/s |
-| create2 | Metal | 728.9 MH/s |
-| create3 / 1nft | OpenCL | 358.6 MH/s |
-| create3 / 1nft | Metal | 362.4 MH/s |
-| profanity | OpenCL | 338.9 MH/s |
-| create3 / 1nft | CPU (NEON, 16 threads) | 88.7 MH/s |
+| create2 | Metal | 724.4 MH/s |
+| create2 | OpenCL | 721.8 MH/s |
+| profanity | OpenCL | 381.6 MH/s |
+| create3 / 1nft | OpenCL | 356.1 MH/s |
+| create3 / 1nft | Metal | 352.2 MH/s |
+| create3 / 1nft | CPU (NEON, 16 threads) | 87.3 MH/s |
 
 CREATE3 runs at about half of CREATE2 because it hashes twice: CREATE2 for the proxy, then CREATE for the contract. Rates are not comparable across modes for that reason. See [docs/benchmarking.md](docs/benchmarking.md).
 

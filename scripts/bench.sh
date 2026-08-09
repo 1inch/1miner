@@ -84,18 +84,19 @@ mode_args() {
     esac
 }
 
-# One measurement. The miner prints a rolling speed line; the last one is the
-# settled figure. Warmup is spent inside the same process so kernel compilation
-# and ramp-up are excluded from the number we keep.
+# One measurement. The miner reports a rolling-window rate while it runs and a
+# post-warmup average when it stops; the latter is what a benchmark should
+# quote, so `--warmup` is passed through and the `Measured:` line is read.
 measure() {
     backend=$1
     kernel=$2
     total=$((WARMUP + MEASURE))
     # shellcheck disable=SC2046
     "$MINER" $(mode_args) --benchmark \
-        --backend "$backend" --kernel "$kernel" --seconds "$total" 2>&1 \
+        --backend "$backend" --kernel "$kernel" \
+        --warmup "$WARMUP" --seconds "$total" 2>&1 \
         | tr '\r' '\n' \
-        | sed -n 's/.*Speed: \([0-9.]*\) MH\/s.*/\1/p' \
+        | sed -n 's/^Measured: \([0-9.]*\) MH\/s.*/\1/p' \
         | tail -1
 }
 
