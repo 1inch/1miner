@@ -8,7 +8,7 @@ use crate::{
     Address, CoreError, Hash, Result, Salt,
     address::{create_address, create2_address, create2_preimage, create3_address},
     keccak256,
-    secp256k1::Point,
+    secp256k1::{Point, address_for_offset},
 };
 
 /// The keccak state the kernels operate on: 200 bytes, addressable as 50
@@ -191,7 +191,25 @@ pub struct ProfanityConfig {
 
 impl ProfanityConfig {
     pub fn address_for_point(&self, point: &Point) -> Address {
-        let account = point.address();
+        self.scored_address(point.address())
+    }
+
+    /// The address a reported offset has to produce, which is what turns a hit
+    /// into a verified one.
+    ///
+    /// A backend reaches an address by walking, and names it with an offset it
+    /// accounts for separately; this reaches the same place by a double-and-add
+    /// ladder over the offset itself. That is what catches the two drifting
+    /// apart, and an offset that names the wrong point is a key the user cannot
+    /// spend.
+    pub fn address_for_offset(&self, offset: &[u8; 32]) -> Option<Address> {
+        address_for_offset(&self.seed_public_key, offset).map(|a| self.scored_address(a))
+    }
+
+    /// `--contract` scores the contract this key would deploy at nonce 0 rather
+    /// than the account itself. Both routes to an address go through here, so
+    /// they cannot disagree about which of the two is being searched for.
+    fn scored_address(&self, account: Address) -> Address {
         if self.contract {
             create_address(&account, 0)
         } else {

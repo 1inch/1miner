@@ -535,16 +535,7 @@ fn run_device(
             // Walk the seed public key forward by the reported offset and check
             // it lands on the reported address. A mismatch means the offset
             // accounting is wrong and the key would be useless.
-            let verified = !job.verify
-                || miner_core::secp256k1::address_for_offset(&cfg.seed_public_key, &offset).map(
-                    |p| {
-                        if cfg.contract {
-                            miner_core::create_address(&p, 0)
-                        } else {
-                            p
-                        }
-                    },
-                ) == Some(address);
+            let verified = !job.verify || cfg.address_for_offset(&offset) == Some(address);
 
             hits.lock().unwrap().push(Hit {
                 score: score as u32,

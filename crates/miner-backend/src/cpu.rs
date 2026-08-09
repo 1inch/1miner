@@ -12,19 +12,35 @@ use std::time::{Duration, Instant};
 use miner_core::{
     MineMode, ModeConfig, ProfanityConfig, SaltConfig,
     scoring::score,
-    secp256k1::{Point, generator, point_add},
+    secp256k1::{Point, add_scalars_mod_n, generator, point_add, scalar_mul_generator},
 };
+use rand::RngCore;
 
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{Backend, DeviceInfo, Hit, Job, Reporter, Result};
+use crate::{Backend, BackendError, DeviceInfo, Hit, Job, Reporter, Result};
 
 pub struct CpuBackend {
     infos: Vec<DeviceInfo>,
     threads: usize,
+    profanity_base: Option<[u8; 32]>,
 }
 
 impl CpuBackend {
     pub fn new(threads: Option<usize>) -> Self {
+        Self::build(threads, None)
+    }
+
+    /// Start the profanity walk at a chosen offset rather than a random one.
+    ///
+    /// This exists for the agreement test: pointed at an offset the OpenCL
+    /// kernel has already reported, the walk derives the address for that exact
+    /// scalar through entirely separate code, so the two can be compared. There
+    /// is no flag for it, because a real search wants the random start.
+    pub fn starting_at(threads: Option<usize>, offset: [u8; 32]) -> Self {
+        Self::build(threads, Some(offset))
+    }
+
+    fn build(threads: Option<usize>, profanity_base: Option<[u8; 32]>) -> Self {
         let threads = threads
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1)
@@ -37,6 +53,7 @@ impl CpuBackend {
                 global_memory: 0,
             }],
             threads,
+            profanity_base,
         }
     }
 }
@@ -155,9 +172,16 @@ impl CpuBackend {
         Ok(())
     }
 
-    /// Walk the seed public key forward one generator step at a time. Each step
-    /// costs a modular inversion, so this is orders of magnitude slower than
-    /// the GPU path and exists to verify it rather than to compete with it.
+    /// Walk forward from a random point on the seed key's line, one generator
+    /// step at a time. Each step costs a modular inversion, so this is orders
+    /// of magnitude slower than the GPU path and exists to verify it rather
+    /// than to compete with it.
+    ///
+    /// The start is drawn per run for the reason the OpenCL path draws one per
+    /// device: from a fixed start, a second run against the same public key
+    /// re-covers the offsets the first one already did, so it adds nothing to a
+    /// search and two people working from the same published key find the same
+    /// addresses.
     fn run_profanity(
         &self,
         cfg: &ProfanityConfig,
@@ -170,25 +194,31 @@ impl CpuBackend {
         let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
 
         let g = generator();
-        let mut point: Point = cfg.seed_public_key;
-        let mut offset: u64 = 0;
+        let base = self.profanity_base.unwrap_or_else(random_base);
+        // A zero base leaves `scalar_mul_generator` at infinity, and adding
+        // that is the identity, so the walk simply starts at the seed itself.
+        let mut point: Point = point_add(
+            Some(&cfg.seed_public_key),
+            scalar_mul_generator(&base).as_ref(),
+        )
+        .ok_or_else(|| {
+            BackendError::Other("the starting offset cancels the seed public key".into())
+        })?;
+        let mut steps: u64 = 0;
         let mut best = job.initial_threshold();
 
         while !should_stop() && job.duration.is_none_or(|d| start.elapsed() < d) {
-            let Some(next) = point_add(Some(&point), Some(&g)) else {
-                break;
-            };
-            point = next;
-            offset += 1;
-
             let address = cfg.address_for_point(&point);
             let value = score(&job.score, &address);
             if value > best {
                 if !job.is_exact() {
                     best = value;
                 }
-                let mut bytes = [0u8; 32];
-                bytes[24..].copy_from_slice(&offset.to_be_bytes());
+                let offset = offset_scalar(&base, steps);
+                // The offset is rebuilt from the base and the step count rather
+                // than read off the walk, so the two can drift; re-deriving the
+                // address from the offset alone is what would notice.
+                let verified = !job.verify || cfg.address_for_offset(&offset) == Some(address);
                 // Straight out, rather than into a collection for the speed
                 // poll to drain the way run_salt needs: this loop is
                 // single-threaded, and draining every 512 steps kept only
@@ -198,18 +228,24 @@ impl CpuBackend {
                     address,
                     salt: None,
                     magic: None,
-                    offset: Some(bytes),
+                    offset: Some(offset),
                     device_index: 0,
-                    verified: true,
+                    verified,
                 });
             }
 
             counter.fetch_add(1, Ordering::Relaxed);
-            if offset % 512 == 0 {
+            steps += 1;
+            if steps % 512 == 0 {
                 meter.sample(counter.load(Ordering::Relaxed));
                 let rate = meter.rate();
                 reporter.on_speed(rate, &[rate]);
             }
+
+            let Some(next) = point_add(Some(&point), Some(&g)) else {
+                break;
+            };
+            point = next;
         }
 
         if let Some(summary) = meter.summary() {
@@ -217,6 +253,32 @@ impl CpuBackend {
         }
         Ok(())
     }
+}
+
+/// Where this run's walk starts: 240 random bits.
+///
+/// The top two bytes stay clear so that `seed_priv + offset` cannot carry past
+/// 256 bits, which is what the OpenCL path reserves the top of its own offset
+/// for. Cryptographic quality is not needed — the security of the result rests
+/// on the user's seed key, which never enters this process — but `rand::rng()`
+/// is OS-seeded, unlike a clock read.
+fn random_base() -> [u8; 32] {
+    let mut base = [0u8; 32];
+    rand::rng().fill_bytes(&mut base);
+    base[0] = 0;
+    base[1] = 0;
+    base
+}
+
+/// The offset naming the point `steps` generator steps beyond `base`.
+///
+/// `base` is below 2²⁴⁰ and `steps` below 2⁶⁴, so the sum is below 2²⁴¹ and the
+/// reduction mod n never fires — which is what keeps this exact, since
+/// `add_scalars_mod_n` reduces only one multiple of n.
+fn offset_scalar(base: &[u8; 32], steps: u64) -> [u8; 32] {
+    let mut delta = [0u8; 32];
+    delta[24..].copy_from_slice(&steps.to_be_bytes());
+    add_scalars_mod_n(base, &delta)
 }
 
 /// Whether the two-lane NEON permutation is used, cached because this is read

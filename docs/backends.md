@@ -18,6 +18,8 @@ Metal exists because Apple deprecated OpenCL: on Apple silicon it is capped at O
 
 Its first job is to be the reference the accelerated backends are checked against, but it is a usable miner for small searches and the answer on a machine with no GPU at all.
 
+Being usable for a real search is why `profanity` draws a random starting offset per run here, as the OpenCL path draws one per device. From a fixed start a second run against the same public key re-covers the offsets the first one already tried, so it would add nothing to a search — and two people working from the same published seed public key would find the same addresses.
+
 On aarch64 the salt modes use a two-lane NEON Keccak, holding each of the 25 Keccak lanes as a `uint64x2_t` so one permutation covers two candidates. That is worth 2.3x on an M4 Max: 88.7 against 38.0 MH/s for create3. It is still several times slower than the same machine's GPU, so this is a fallback rather than a contender.
 
 `MINER_NO_NEON=1` forces the plain scalar path. Use it to A/B the two, or as a safety valve if the SIMD path ever misbehaves on some hardware. The test suite asserts both produce identical addresses for every mode, so the choice is a performance one only.

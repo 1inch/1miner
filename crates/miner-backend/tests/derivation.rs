@@ -31,6 +31,44 @@ impl Reporter for &Collector {
     fn on_speed(&mut self, _total: f64, _per_device: &[f64]) {}
 }
 
+/// Run a backend until it reports a score of `stop_at` or the job's duration
+/// expires, and return the hits in the order they arrived. `u32::MAX` means
+/// "let the whole duration run".
+fn run_until(backend: &mut dyn Backend, job: &Job, stop_at: u32) -> Vec<Hit> {
+    struct Watch<'a> {
+        hits: &'a Collector,
+        found: &'a AtomicBool,
+        stop_at: u32,
+    }
+    impl Reporter for Watch<'_> {
+        fn on_hit(&mut self, hit: &Hit) {
+            if hit.score >= self.stop_at {
+                self.found.store(true, Ordering::SeqCst);
+            }
+            self.hits.hits.lock().unwrap().push(hit.clone());
+        }
+        fn on_speed(&mut self, _total: f64, _per_device: &[f64]) {}
+    }
+
+    let collector = Collector::default();
+    let found = AtomicBool::new(false);
+    let stop = || found.load(Ordering::SeqCst);
+    backend
+        .run(
+            job,
+            &mut Watch {
+                hits: &collector,
+                found: &found,
+                stop_at,
+            },
+            &stop,
+        )
+        .expect("backend run failed");
+
+    let hits = collector.hits.lock().unwrap();
+    hits.clone()
+}
+
 fn config(mode: MineMode) -> SaltConfig {
     let deployer = parse_address("0x9fBB3DF7C40Da2e5A0dE984fFE2CCB7C47cd0ABf").unwrap();
     let caller = (mode == MineMode::Nft)
@@ -67,36 +105,7 @@ fn planted_target(mut backend: Box<dyn Backend>, mode: MineMode, round_size: usi
         exact_score: None,
     };
 
-    let collector = Collector::default();
-    let found = AtomicBool::new(false);
-    let stop = || found.load(Ordering::SeqCst);
-
-    struct Watch<'a> {
-        inner: &'a Collector,
-        found: &'a AtomicBool,
-    }
-    impl Reporter for Watch<'_> {
-        fn on_hit(&mut self, hit: &Hit) {
-            if hit.score == 20 {
-                self.found.store(true, Ordering::SeqCst);
-            }
-            self.inner.hits.lock().unwrap().push(hit.clone());
-        }
-        fn on_speed(&mut self, _total: f64, _per_device: &[f64]) {}
-    }
-
-    backend
-        .run(
-            &job,
-            &mut Watch {
-                inner: &collector,
-                found: &found,
-            },
-            &stop,
-        )
-        .expect("backend run failed");
-
-    let hits = collector.hits.lock().unwrap();
+    let hits = run_until(&mut *backend, &job, 20);
     let best = hits
         .iter()
         .max_by_key(|h| h.score)
@@ -200,33 +209,35 @@ fn exact_mode_reports_repeated_full_matches() {
     exact_matches(Box::new(CpuBackend::new(Some(2))), 1 << 12);
 }
 
+/// The generator as the seed public key: its private half is 1, so a failing
+/// case here can be reproduced by hand.
+fn profanity_config(contract: bool) -> ProfanityConfig {
+    ProfanityConfig {
+        seed_public_key: generator(),
+        contract,
+    }
+}
+
+fn profanity_job(cfg: ProfanityConfig, score: ScoreSpec, seconds: u64) -> Job {
+    Job {
+        mode: ModeConfig::Profanity(cfg),
+        score,
+        keccak: KeccakVariant::Tuned,
+        tuning: Tuning::default(),
+        duration: Some(Duration::from_secs(seconds)),
+        verify: true,
+        exact_score: None,
+    }
+}
+
 /// The CPU profanity loop reports each hit as it finds it, so every hit has to
 /// arrive exactly once. Re-reporting the newest one on each speed poll — which
 /// is what passing `len - 1` to a drain does — shows up here as a repeated
 /// offset and a score that stops climbing.
 #[test]
 fn cpu_profanity_reports_each_hit_once() {
-    let job = Job {
-        mode: ModeConfig::Profanity(ProfanityConfig {
-            seed_public_key: generator(),
-            contract: false,
-        }),
-        score: ScoreSpec::zeros(),
-        keccak: KeccakVariant::Tuned,
-        tuning: Tuning::default(),
-        duration: Some(Duration::from_secs(2)),
-        verify: true,
-        exact_score: None,
-    };
-
-    let collector = Collector::default();
-    let stop = || false;
-    let mut backend = CpuBackend::new(Some(1));
-    backend
-        .run(&job, &mut &collector, &stop)
-        .expect("run failed");
-
-    let hits = collector.hits.lock().unwrap();
+    let job = profanity_job(profanity_config(false), ScoreSpec::zeros(), 2);
+    let hits = run_until(&mut CpuBackend::new(Some(1)), &job, u32::MAX);
     assert!(!hits.is_empty(), "no hits, so nothing here was checked");
 
     let mut previous = 0;
@@ -239,6 +250,78 @@ fn cpu_profanity_reports_each_hit_once() {
         previous = hit.score;
         let offset = hit.offset.expect("a profanity hit carries an offset");
         assert!(offsets.insert(offset), "an offset was reported twice");
+    }
+}
+
+/// Two runs against one public key must not walk the same offsets, or a second
+/// attempt adds nothing to a search and two people holding the same published
+/// seed key find the same addresses. From a fixed start both runs report the
+/// same first offset, which is what this catches.
+#[test]
+fn cpu_profanity_starts_somewhere_new_each_run() {
+    let job = profanity_job(profanity_config(false), ScoreSpec::zeros(), 5);
+    let first = run_until(&mut CpuBackend::new(Some(1)), &job, 1);
+    let second = run_until(&mut CpuBackend::new(Some(1)), &job, 1);
+
+    let first = first.first().expect("the first run reported no hit");
+    let second = second.first().expect("the second run reported no hit");
+    assert_ne!(
+        first.offset, second.offset,
+        "both runs started from the same offset"
+    );
+    assert_ne!(first.address, second.address);
+}
+
+/// The walk starts at exactly the offset it is handed and reports that offset
+/// for its first candidate. This is the contract the cross-backend agreement
+/// test depends on, so it is pinned separately from the test that uses it.
+#[test]
+fn cpu_profanity_starts_at_the_offset_it_is_given() {
+    let cfg = profanity_config(false);
+    // Top two bytes clear, as a drawn offset has them.
+    let mut base = [0u8; 32];
+    for (i, b) in base.iter_mut().enumerate().skip(2) {
+        *b = (i as u8).wrapping_mul(43).wrapping_add(3);
+    }
+    let expected = cfg
+        .address_for_offset(&base)
+        .expect("the offset must name a point");
+
+    let score = ScoreSpec::matching(&hex::encode(expected)).unwrap();
+    let job = profanity_job(cfg, score, 10);
+    let hits = run_until(&mut CpuBackend::starting_at(Some(1), base), &job, 20);
+
+    let hit = hits
+        .first()
+        .expect("the very first candidate is the one asked for");
+    assert_eq!(hit.score, 20, "the walk did not begin at the given offset");
+    assert_eq!(hit.address, expected);
+    assert_eq!(hit.offset, Some(base));
+    assert!(hit.verified);
+}
+
+/// A profanity hit names its address with an offset the walk accounts for
+/// separately from the point it actually reached — the same split that makes
+/// the salt modes' `salt_at` worth testing. Nothing inside the walk would
+/// notice the two drifting apart, so every reported offset is re-derived here
+/// the long way round, through a double-and-add ladder rather than a walk.
+#[test]
+fn cpu_profanity_offsets_re_derive_to_the_address_reported() {
+    for contract in [false, true] {
+        let cfg = profanity_config(contract);
+        let job = profanity_job(cfg.clone(), ScoreSpec::zeros(), 2);
+        let hits = run_until(&mut CpuBackend::new(Some(1)), &job, u32::MAX);
+        assert!(!hits.is_empty(), "no hits, so nothing here was checked");
+
+        for hit in &hits {
+            let offset = hit.offset.expect("a profanity hit carries an offset");
+            assert_eq!(
+                cfg.address_for_offset(&offset),
+                Some(hit.address),
+                "contract={contract}: the offset names a different address"
+            );
+            assert!(hit.verified, "contract={contract}: hit reported unverified");
+        }
     }
 }
 
@@ -368,33 +451,7 @@ mod opencl {
                 exact_score: None,
             };
 
-            let collector = Collector::default();
-            let found = AtomicBool::new(false);
-            struct Watch<'a> {
-                inner: &'a Collector,
-                found: &'a AtomicBool,
-            }
-            impl Reporter for Watch<'_> {
-                fn on_hit(&mut self, hit: &Hit) {
-                    if hit.score == 20 {
-                        self.found.store(true, Ordering::SeqCst);
-                    }
-                    self.inner.hits.lock().unwrap().push(hit.clone());
-                }
-                fn on_speed(&mut self, _t: f64, _p: &[f64]) {}
-            }
-            let stop = || found.load(Ordering::SeqCst);
-            b.run(
-                &job,
-                &mut Watch {
-                    inner: &collector,
-                    found: &found,
-                },
-                &stop,
-            )
-            .expect("run failed");
-
-            let hits = collector.hits.lock().unwrap();
+            let hits = run_until(&mut b, &job, 20);
             let best = hits.iter().max_by_key(|h| h.score).expect("no hits");
             assert_eq!(
                 best.address,
