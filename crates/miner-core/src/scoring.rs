@@ -113,7 +113,14 @@ impl ScoreSpec {
             .strip_prefix("0x")
             .or_else(|| pattern.strip_prefix("0X"))
             .unwrap_or(pattern);
-        let chars: Vec<char> = pattern.chars().collect();
+        let mut chars: Vec<char> = pattern.chars().collect();
+        // A right-anchored pattern aligns to the address's last nibble, so an
+        // odd-length one takes a leading wildcard. Chunking from the left and
+        // shifting whole bytes would put its final digit in the high nibble of
+        // byte 19, moving the whole pattern half a byte towards the front.
+        if matches!(anchor, Anchor::End) && chars.len() % 2 == 1 {
+            chars.insert(0, '.');
+        }
         let bytes = chars.len().div_ceil(2);
         if bytes > 20 {
             return Err(CoreError::Config(format!(
@@ -258,6 +265,16 @@ mod tests {
         parse_address(s).unwrap()
     }
 
+    /// A 40-digit address with `digits` at the front, zeroes after it.
+    fn pad_right(digits: &str) -> String {
+        format!("{digits:0<40}")
+    }
+
+    /// A 40-digit address with `digits` at the end, zeroes before it.
+    fn pad_left(digits: &str) -> String {
+        format!("{digits:0>40}")
+    }
+
     #[test]
     fn leading_counts_nibbles_and_stops() {
         let spec = ScoreSpec::leading('0').unwrap();
@@ -320,6 +337,81 @@ mod tests {
         assert_eq!(score(&spec, &addr("0x0000000000000000000000000000000000beefff")), 0);
     }
 
+    /// An odd-length pattern must put its last digit in the *low* nibble of
+    /// byte 19, leaving the leading half-byte free. Chunking from the left used
+    /// to leave the pattern one nibble too far towards the front, so an address
+    /// genuinely ending in "abc" scored zero.
+    #[test]
+    fn trailing_aligns_an_odd_length_pattern_to_the_last_nibble() {
+        let spec = ScoreSpec::trailing("abc").unwrap();
+        assert_eq!((spec.data1[18], spec.data2[18]), (0x0f, 0x0a));
+        assert_eq!((spec.data1[19], spec.data2[19]), (0xff, 0xbc));
+        // The half-masked byte still counts as constrained, so --exact-style
+        // all-or-nothing comparisons stay reachable.
+        assert_eq!(spec.constrained_bytes(), 2);
+        assert_eq!(score(&spec, &addr("0x0000000000000000000000000000000000000abc")), 2);
+        // The nibble-shifted address is what this used to search for.
+        assert_eq!(score(&spec, &addr("0x000000000000000000000000000000000000abc0")), 0);
+
+        // One digit constrains one nibble of the final byte and nothing else.
+        let single = ScoreSpec::trailing("c").unwrap();
+        assert_eq!((single.data1[19], single.data2[19]), (0x0f, 0x0c));
+        assert_eq!(single.constrained_bytes(), 1);
+        assert_eq!(score(&single, &addr("0x000000000000000000000000000000000000000c")), 1);
+        assert_eq!(score(&single, &addr("0x00000000000000000000000000000000000000c0")), 0);
+    }
+
+    /// Both anchors have to hold at every pattern length, not only the even
+    /// ones the fixed-string tests above happen to use.
+    #[test]
+    fn mask_alignment_holds_at_every_pattern_length() {
+        const DIGITS: &str = "123456789abcdef";
+
+        for len in 1..=DIGITS.len() {
+            let head = &DIGITS[..len];
+            let tail = &DIGITS[DIGITS.len() - len..];
+            let start = ScoreSpec::matching(head).unwrap();
+            let end = ScoreSpec::trailing(tail).unwrap();
+
+            // At its anchor the pattern satisfies every byte it constrains.
+            let (from_start, from_end) = (pad_right(head), pad_left(tail));
+            assert_eq!(
+                score(&start, &addr(&from_start)),
+                start.constrained_bytes(),
+                "--matching {head} should match {from_start} in full"
+            );
+            assert_eq!(
+                score(&end, &addr(&from_end)),
+                end.constrained_bytes(),
+                "--trailing {tail} should match {from_end} in full"
+            );
+
+            // One nibble away from it, it no longer does.
+            let off_start = pad_right(&format!("0{head}"));
+            let off_end = pad_left(&format!("{tail}0"));
+            assert!(
+                score(&start, &addr(&off_start)) < start.constrained_bytes(),
+                "--matching {head} should not match {off_start} in full"
+            );
+            assert!(
+                score(&end, &addr(&off_end)) < end.constrained_bytes(),
+                "--trailing {tail} should not match {off_end} in full"
+            );
+        }
+    }
+
+    /// The wildcard pad must not cost a right-anchored pattern its last byte:
+    /// 39 digits still cover an address, 41 still do not.
+    #[test]
+    fn the_wildcard_pad_does_not_move_the_length_limit() {
+        let widest = ScoreSpec::trailing(&"a".repeat(39)).unwrap();
+        assert_eq!(widest.constrained_bytes(), 20);
+        assert_eq!(widest.data1[0], 0x0f);
+        assert!(ScoreSpec::trailing(&"a".repeat(40)).is_ok());
+        assert!(ScoreSpec::trailing(&"a".repeat(41)).is_err());
+        assert!(ScoreSpec::matching(&"a".repeat(41)).is_err());
+    }
+
     #[test]
     fn mirror_reflects_around_the_centre() {
         // Bytes 9 and 10 are 0x12 and 0x21, so two nibbles mirror; bytes 8 and
@@ -380,6 +472,8 @@ mod tests {
     fn constrained_bytes_counts_only_masked_positions() {
         assert_eq!(ScoreSpec::matching("dead").unwrap().constrained_bytes(), 2);
         assert_eq!(ScoreSpec::trailing("beef").unwrap().constrained_bytes(), 2);
+        // A half-masked byte constrains that byte too: "abc" pads to ".abc".
+        assert_eq!(ScoreSpec::trailing("abc").unwrap().constrained_bytes(), 2);
         // "de..beef" leaves byte 1 free, so three bytes are constrained.
         assert_eq!(ScoreSpec::matching("de..beef").unwrap().constrained_bytes(), 3);
         // A whole address is 20 bytes.
