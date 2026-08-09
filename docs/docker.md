@@ -41,6 +41,16 @@ docker run --rm --gpus all 1miner nvidia-smi
 
 Any argument that is not a 1miner subcommand or flag is run as a plain command, which is what makes those work.
 
+## What the container lets you do
+
+Two properties are worth stating rather than discovering.
+
+The miner runs as **root**: the image sets no `USER`. Adding one risks access to the GPU device nodes on host and toolkit combinations nobody here can test against, which is a poor trade for a container the operator already controls end to end.
+
+The first argument reaches `exec` whenever it is not a 1miner subcommand or a flag, so the container is a general command runner and not only a miner. [`docker/entrypoint.sh`](../docker/entrypoint.sh) decides this from an explicit allowlist — `profanity`, `create2`, `create3`, `1nft`, `self-test`, `help`, and anything beginning with `-` — rather than guessing from the shape of the argument, because 1miner's own subcommands do not start with a dash. `clinfo`, `nvidia-smi` and `sh` working for diagnosing a bad rental is the point of it. `MINER_ARGS` cannot reach that branch: it is consulted only when no arguments were given at all, so an environment variable can never turn into an arbitrary command.
+
+Both are deliberate for a container you start yourself on hardware you rented. Revisit them if the image is ever run somewhere multi-tenant, or anywhere its arguments come from someone else.
+
 ## Environment variables
 
 | Variable | Effect |
