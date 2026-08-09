@@ -1,0 +1,13 @@
+# The reference miners are for development only and are large.
+references/
+
+target/
+**/target/
+
+.git/
+.github/
+docs/
+*.md
+!README.md
+
+.DS_Store

@@ -1,0 +1,24 @@
+[package]
+name = "miner-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pluggable compute backends (OpenCL, Metal, CPU) for 1miner"
+
+[features]
+default = ["opencl"]
+opencl = ["dep:opencl3"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+
+[dependencies]
+miner-core.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+opencl3 = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/miner-core",
+    "crates/miner-backend",
+    "crates/miner-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/1inch/1miner"
+rust-version = "1.85"
+
+[workspace.dependencies]
+miner-core = { path = "crates/miner-core" }
+miner-backend = { path = "crates/miner-backend" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+hex = "0.4"
+opencl3 = "0.12"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+rand = "0.9"
+sha3 = "0.10"
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

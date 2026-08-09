@@ -1,0 +1,26 @@
+[package]
+name = "miner-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "1miner command line interface"
+
+[[bin]]
+name = "1miner"
+path = "src/main.rs"
+
+[features]
+default = ["opencl"]
+opencl = ["miner-backend/opencl"]
+metal = ["miner-backend/metal"]
+
+[dependencies]
+miner-core.workspace = true
+miner-backend.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+hex.workspace = true
+rand.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "miner-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Address derivation, scoring and mode configuration shared by all 1miner backends"
+
+[dependencies]
+hex.workspace = true
+sha3.workspace = true
+thiserror.workspace = true

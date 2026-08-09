@@ -1,0 +1,11 @@
+/target
+**/target
+
+# Reference miners build artefacts, when building them for comparison.
+references/
+references/**/*.o
+references/**/*.x64
+references/**/*.exe
+references/**/cache-opencl.*
+
+.DS_Store
