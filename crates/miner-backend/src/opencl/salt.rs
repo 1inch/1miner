@@ -449,8 +449,9 @@ mod tests {
         assert_eq!(shared.load(Ordering::Relaxed), 9);
     }
 
-    /// The M6 case: another device is already ahead, so this one reports
-    /// nothing and the bar it reloads afterwards is the leader's.
+    /// A device another has already beaten reports nothing, so the bar it
+    /// reloads afterwards is the leader's. That is the round where its kernel
+    /// used to carry on writing results the host reads and throws away.
     #[test]
     fn a_beaten_hit_leaves_the_leader_in_the_shared_bar() {
         let cfg = config();
