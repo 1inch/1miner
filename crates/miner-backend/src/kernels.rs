@@ -32,4 +32,15 @@ mod tests {
             assert!(keccak.contains("0x80000000"));
         }
     }
+
+    /// The result counter is a `uint`, and a narrower copy of it would make
+    /// every 256th writer believe it was first. Only a GPU shows what that
+    /// costs, so this is the tripwire for a machine without one.
+    #[test]
+    fn the_first_writer_check_reads_the_whole_counter() {
+        for source in [SALT, PROFANITY] {
+            assert!(source.contains("const uint hasResult = atomic_inc"));
+            assert!(!source.contains("uchar hasResult"));
+        }
+    }
 }

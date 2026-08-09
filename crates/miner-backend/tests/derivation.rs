@@ -150,10 +150,9 @@ fn cpu_nft_hit_carries_a_usable_magic() {
 
 /// `--exact` must keep reporting full matches instead of climbing to a best
 /// score, and every reported address must satisfy the whole mask.
-#[test]
-fn exact_mode_reports_repeated_full_matches() {
+fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize) {
     let cfg = config(MineMode::Create2);
-    // Two constrained nibbles is frequent enough to hit many times quickly.
+    // One constrained nibble is frequent enough to hit many times quickly.
     let spec = ScoreSpec::matching("a").unwrap();
     let needed = spec.constrained_bytes();
 
@@ -162,7 +161,7 @@ fn exact_mode_reports_repeated_full_matches() {
         score: spec,
         keccak: KeccakVariant::Tuned,
         tuning: Tuning {
-            round_size: 1 << 12,
+            round_size,
             work_size: 64,
             no_cache: true,
             ..Tuning::default()
@@ -176,7 +175,6 @@ fn exact_mode_reports_repeated_full_matches() {
 
     let collector = Collector::default();
     let stop = || false;
-    let mut backend = CpuBackend::new(Some(2));
     backend
         .run(&job, &mut &collector, &stop)
         .expect("run failed");
@@ -190,10 +188,15 @@ fn exact_mode_reports_repeated_full_matches() {
     for hit in hits.iter() {
         // Never a partial match, and never a climbing score.
         assert_eq!(hit.score, needed, "exact mode reported a partial match");
-        assert!(hit.verified);
+        assert!(hit.verified, "exact mode hit failed CPU re-derivation");
         // The mask constrains the high nibble of byte 0 to 0xa.
         assert_eq!(hit.address[0] >> 4, 0xa);
     }
+}
+
+#[test]
+fn exact_mode_reports_repeated_full_matches() {
+    exact_matches(Box::new(CpuBackend::new(Some(2))), 1 << 12);
 }
 
 /// Without `--exact` the bar climbs, so each reported score is strictly better
@@ -252,6 +255,17 @@ mod opencl {
             let Some(b) = backend() else { return };
             planted_target(b, mode, 1 << 16);
         }
+    }
+
+    /// Every match in an `--exact` round targets the same result slot, and a
+    /// loose mask puts thousands of work items through it. That is the workload
+    /// where a truncated first-writer check lets two of them interleave their
+    /// writes, so the salt in the slot belongs to one and the address to
+    /// another and re-derivation disagrees.
+    #[test]
+    fn opencl_exact_mode_reports_untorn_full_matches() {
+        let Some(b) = backend() else { return };
+        exact_matches(b, 1 << 16);
     }
 
     /// The two Keccak variants are meant to be interchangeable, so they must

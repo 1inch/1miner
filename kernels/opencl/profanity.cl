@@ -718,9 +718,10 @@ static inline void profanity_iterate(__global mp_number * const pDeltaX, __globa
 
 void profanity_result_update(const size_t id, const uint * const address, __global result * const pResult, const uchar score, const uchar scoreMax) {
 	if (score && score > scoreMax) {
-		uchar hasResult = atomic_inc(&pResult[score].found); // NOTE: If "too many" results are found it'll wrap around to 0 again and overwrite last result. Only relevant if global worksize exceeds MAX(uint).
-
-		// Save only one result for each score, the first.
+		// Save only one result for each score, the first. The counter is a uint,
+		// and truncating it here would let every 256th writer believe it was
+		// first rather than the MAX(uint)th the upstream note claims.
+		const uint hasResult = atomic_inc(&pResult[score].found);
 		if (hasResult == 0) {
 			pResult[score].foundId = id;
 

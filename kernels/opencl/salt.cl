@@ -106,8 +106,11 @@ __kernel void salt_iterate(__global result * const pResult, __global const mode 
 
 void salt_result_update(const uchar * const H, __global result * const pResult, const uchar score, const uchar scoreMax, const uint deviceIndex, const uint round) {
 	if (score && score > scoreMax) {
-		// One slot per score, first writer wins.
-		const uchar hasResult = atomic_inc(&pResult[score].found);
+		// One slot per score, first writer wins. The counter is a uint, and
+		// truncating it here would let every 256th writer believe it was first;
+		// two that do interleave their writes, leaving one item's salt beside
+		// another's address.
+		const uint hasResult = atomic_inc(&pResult[score].found);
 		if (hasResult == 0) {
 			// Rebuild this work-item's state to recover the salt that produced
 			// the hit. This repeats the arithmetic above rather than carrying
