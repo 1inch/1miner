@@ -57,8 +57,14 @@ macro_rules! rotl {
 }
 
 /// `a ^ (!b & c)`, the Keccak chi step, as one XOR and one BIC.
+///
+/// # Safety
+///
+/// Requires NEON, which is part of the aarch64 baseline this module is gated on.
 #[inline(always)]
 unsafe fn chi(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    // SAFETY: both intrinsics are register-only, so the target feature is the
+    // whole obligation and aarch64 always has it.
     unsafe { veorq_u64(a, vbicq_u64(c, b)) }
 }
 
@@ -68,8 +74,15 @@ unsafe fn chi(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
 /// same layout the OpenCL kernel uses. Every index below is a literal so the
 /// array stays in registers; computed indices spill and roughly halve the rate,
 /// which is the mistake the Metal kernel made first.
+///
+/// # Safety
+///
+/// Requires NEON, which is part of the aarch64 baseline this module is gated on.
 #[inline]
 unsafe fn keccak_f_x2(st: &mut [uint64x2_t; 25]) {
+    // SAFETY: every intrinsic in this block is register-only — no loads, no
+    // stores, no pointers — so NEON's availability is the only obligation, and
+    // aarch64 always has it. Indices are literals bounded by the array's 25.
     unsafe {
         // Trailing keccak pad byte: byte 135 is the top byte of lane 16.
         st[16] = veorq_u64(st[16], vdupq_n_u64(0x8000_0000_0000_0000));
@@ -179,22 +192,35 @@ unsafe fn keccak_f_x2(st: &mut [uint64x2_t; 25]) {
 }
 
 /// Pack two scalar states into lane-interleaved vectors.
+///
+/// # Safety
+///
+/// Requires NEON, which is part of the aarch64 baseline this module is gated on.
 #[inline]
 unsafe fn pack(a: &[u64; 25], b: &[u64; 25]) -> [uint64x2_t; 25] {
+    // SAFETY: register-only, so NEON's availability is the only obligation.
     let mut out = [unsafe { vdupq_n_u64(0) }; 25];
     for (i, slot) in out.iter_mut().enumerate() {
         let pair = [a[i], b[i]];
+        // SAFETY: the load reads exactly the two `u64` of `pair`, a live local
+        // array, and an aligned `[u64; 2]` is a valid source for `vld1q_u64`.
         *slot = unsafe { vld1q_u64(pair.as_ptr()) };
     }
     out
 }
 
 /// Extract the 20-byte address at bytes 12..32 of each lane's state.
+///
+/// # Safety
+///
+/// Requires NEON, which is part of the aarch64 baseline this module is gated on.
 #[inline]
 unsafe fn unpack_addresses(st: &[uint64x2_t; 25]) -> [Address; LANES] {
     let mut bytes = [[0u8; 200]; LANES];
     for (i, lane) in st.iter().enumerate() {
         let mut pair = [0u64; 2];
+        // SAFETY: the store writes exactly the two `u64` of `pair`, a live
+        // local array with room for both lanes.
         unsafe { vst1q_u64(pair.as_mut_ptr(), *lane) };
         for (slot, word) in bytes.iter_mut().zip(pair) {
             slot[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
@@ -262,6 +288,8 @@ pub fn addresses(
         return first;
     }
 
+    // SAFETY: as for the first hash above — NEON is guaranteed on aarch64, and
+    // the only pointers involved are to local fixed-size arrays.
     unsafe {
         let a = create_state_for(&first[0]);
         let b = create_state_for(&first[1]);

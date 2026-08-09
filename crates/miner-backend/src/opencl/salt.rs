@@ -218,6 +218,9 @@ fn run_device(
     let kernel =
         Kernel::create(&program, "salt_iterate").map_err(cl_err("missing salt_iterate"))?;
 
+    // SAFETY: a null host pointer with neither CL_MEM_USE_HOST_PTR nor
+    // CL_MEM_COPY_HOST_PTR set asks OpenCL to own the allocation, so there is no
+    // host memory whose lifetime has to be upheld here.
     let mut result_buf = unsafe {
         Buffer::<ClResult>::create(
             &context,
@@ -227,12 +230,16 @@ fn run_device(
         )
     }
     .map_err(cl_err("failed to allocate result buffer"))?;
+    // SAFETY: as above, OpenCL owns the allocation.
     let mut mode_buf =
         unsafe { Buffer::<ClMode>::create(&context, CL_MEM_READ_ONLY, 1, std::ptr::null_mut()) }
             .map_err(cl_err("failed to allocate mode buffer"))?;
 
     let mut results = vec![ClResult::default(); MAX_SCORE + 1];
     let modes = [ClMode::from(&job.score)];
+    // SAFETY: both writes are blocking, so the source slices only have to be
+    // live for the duration of the call, and each holds exactly as many elements
+    // as the buffer it fills was created with.
     unsafe {
         queue
             .enqueue_write_buffer(&mut result_buf, CL_BLOCKING, 0, &results, &[])
@@ -257,6 +264,10 @@ fn run_device(
             break;
         }
 
+        // SAFETY: the read is non-blocking, so `results` has to stay put and
+        // untouched until the transfer completes. It is borrowed mutably by the
+        // event, lives for the whole loop, and is only read after
+        // `read_event.wait()` below.
         let read_event = unsafe {
             queue.enqueue_read_buffer(&result_buf, CL_NON_BLOCKING, 0, &mut results, &[])
         }
@@ -265,6 +276,9 @@ fn run_device(
         // The queue is in-order, so this lands after the read above has
         // captured the previous round and before this round's kernel runs.
         if job.is_exact() {
+            // SAFETY: non-blocking, so the source has to outlive the transfer.
+            // `zeros` is allocated before the loop and dropped after it, and
+            // nothing writes to it.
             unsafe {
                 queue
                     .enqueue_write_buffer(&mut result_buf, CL_NON_BLOCKING, 0, &zeros, &[])
@@ -276,6 +290,10 @@ fn run_device(
         let mut offset = 0usize;
         while offset < round_size {
             let this = chunk.min(round_size - offset);
+            // SAFETY: the argument types and their order match `salt_iterate`'s
+            // parameters in kernels/opencl/salt.cl, and every one of them —
+            // both buffers and the three scalars — outlives the enqueue, which
+            // is drained by `queue.flush()` and the event wait below.
             unsafe {
                 let mut exec = ExecuteKernel::new(&kernel);
                 exec.set_arg(&result_buf)

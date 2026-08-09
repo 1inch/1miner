@@ -19,13 +19,16 @@ pub(crate) fn cl_err<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> Backend
 /// A device handle that can cross a thread boundary.
 ///
 /// `cl_device_id` is `*mut c_void`, so Rust treats it as neither `Send` nor
-/// `Sync`. It is an opaque handle rather than a pointer we dereference, and the
-/// OpenCL specification requires implementations to be thread safe, so passing
-/// one to a worker thread is sound.
+/// `Sync`.
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceId(pub cl_device_id);
 
+// SAFETY: the handle is opaque — nothing in this crate dereferences it, it is
+// only handed back to the driver — and the OpenCL specification requires
+// implementations to be thread safe, so moving one to a worker thread is sound.
 unsafe impl Send for DeviceId {}
+// SAFETY: as for `Send` above. Sharing the handle is what lets each device
+// thread hold its own context while the dispatcher keeps the list.
 unsafe impl Sync for DeviceId {}
 
 /// Every GPU the platform exposes, in platform order, with the requested

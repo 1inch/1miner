@@ -336,6 +336,9 @@ fn run_device(
 
     let size = job.tuning.profanity_round_size();
 
+    // SAFETY: every allocation below passes a null host pointer with neither
+    // CL_MEM_USE_HOST_PTR nor CL_MEM_COPY_HOST_PTR, so OpenCL owns the storage
+    // and no host lifetime has to be upheld. This applies to all seven.
     let mut mem_precomp = unsafe {
         Buffer::<ClPoint>::create(
             &context,
@@ -345,18 +348,22 @@ fn run_device(
         )
     }
     .map_err(cl_err("failed to allocate precomp buffer"))?;
+    // SAFETY: as above.
     let mem_delta_x = unsafe {
         Buffer::<MpNumber>::create(&context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
     }
     .map_err(cl_err("failed to allocate deltaX buffer"))?;
+    // SAFETY: as above.
     let mem_inversed = unsafe {
         Buffer::<MpNumber>::create(&context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
     }
     .map_err(cl_err("failed to allocate inverse buffer"))?;
+    // SAFETY: as above.
     let mem_prev_lambda = unsafe {
         Buffer::<MpNumber>::create(&context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
     }
     .map_err(cl_err("failed to allocate lambda buffer"))?;
+    // SAFETY: as above.
     let mut mem_result = unsafe {
         Buffer::<ClResult>::create(
             &context,
@@ -366,14 +373,19 @@ fn run_device(
         )
     }
     .map_err(cl_err("failed to allocate result buffer"))?;
+    // SAFETY: as above.
     let mut mem_data1 =
         unsafe { Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, 20, std::ptr::null_mut()) }
             .map_err(cl_err("failed to allocate data1"))?;
+    // SAFETY: as above.
     let mut mem_data2 =
         unsafe { Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, 20, std::ptr::null_mut()) }
             .map_err(cl_err("failed to allocate data2"))?;
 
     let mut results = vec![ClResult::default(); MAX_SCORE + 1];
+    // SAFETY: all four writes are blocking, so each source only has to be live
+    // for the duration of its call, and each holds exactly as many elements as
+    // the buffer it fills was created with.
     unsafe {
         queue
             .enqueue_write_buffer(&mut mem_precomp, CL_BLOCKING, 0, precomp, &[])
@@ -403,6 +415,10 @@ fn run_device(
     let mut initialized = 0usize;
     while initialized < size {
         let run = init_chunk.min(size - initialized);
+        // SAFETY: the argument types and their order match `profanity_init`'s
+        // parameters in kernels/opencl/profanity.cl, and every buffer and scalar
+        // passed outlives the enqueue, which is drained by the flush below and
+        // the `queue.finish()` after the loop.
         unsafe {
             ExecuteKernel::new(&kernel_init)
                 .set_arg(&mem_precomp)
@@ -432,6 +448,10 @@ fn run_device(
             break;
         }
 
+        // SAFETY: the read is non-blocking, so `results` has to stay put and
+        // untouched until the transfer completes. It is borrowed mutably by the
+        // event, lives for the whole loop, and is only read after
+        // `read_event.wait()` below.
         let read_event = unsafe {
             queue.enqueue_read_buffer(&mem_result, CL_NON_BLOCKING, 0, &mut results, &[])
         }
@@ -440,6 +460,9 @@ fn run_device(
         // In-order queue: this lands after the read above and before the
         // kernels below.
         if job.is_exact() {
+            // SAFETY: non-blocking, so the source has to outlive the transfer.
+            // `zeros` is allocated before the loop and dropped after it, and
+            // nothing writes to it.
             unsafe {
                 queue
                     .enqueue_write_buffer(&mut mem_result, CL_NON_BLOCKING, 0, &zeros, &[])
@@ -453,6 +476,10 @@ fn run_device(
             size / job.tuning.inverse_size,
             work_max,
             local,
+            // SAFETY: both arguments match `profanity_inverse`'s parameters in
+            // kernels/opencl/profanity.cl, and both buffers are captured by
+            // reference from this function's scope, so they outlive every
+            // enqueue the closure feeds.
             |exec| unsafe {
                 exec.set_arg(&mem_delta_x).set_arg(&mem_inversed);
             },
@@ -463,6 +490,10 @@ fn run_device(
             size,
             work_max,
             local,
+            // SAFETY: the arguments and their order match the iterate kernel
+            // selected by `iterate_kernel_name`, and every buffer and scalar is
+            // captured by reference from this function's scope, so all of them
+            // outlive the enqueues the closure feeds.
             |exec| unsafe {
                 exec.set_arg(&mem_delta_x)
                     .set_arg(&mem_inversed)
@@ -530,6 +561,10 @@ fn run_device(
 }
 
 /// Split a launch into `work_max` sized pieces, as the reference dispatcher does.
+///
+/// `set_args` is where the kernel's arguments are bound, so matching them to the
+/// kernel's parameters is the caller's responsibility; each call site carries the
+/// safety comment for its own argument list.
 fn enqueue_chunked(
     queue: &CommandQueue,
     kernel: &Kernel,
@@ -541,6 +576,9 @@ fn enqueue_chunked(
     let mut offset = 0usize;
     while offset < total {
         let run = work_max.min(total - offset);
+        // SAFETY: binding the arguments belongs to `set_args`, and each call
+        // site states its own case; what this block adds is the work-item range,
+        // where `offset + run` never exceeds `total`.
         unsafe {
             let mut exec = ExecuteKernel::new(kernel);
             set_args(&mut exec);

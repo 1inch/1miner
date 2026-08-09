@@ -160,6 +160,11 @@ impl MetalBackend {
             // --exact mode both are cleared each round; otherwise a repeat
             // match at the same score would be silently dropped.
             if job.is_exact() {
+                // SAFETY: both pointers come from `contents()` on a
+                // StorageModeShared buffer, and the lengths are exactly the ones
+                // the buffers were allocated with above. The previous round was
+                // waited on at the end of the loop body, so no GPU work is in
+                // flight and nothing else holds a reference to the storage.
                 unsafe {
                     std::ptr::write_bytes(
                         results.contents().as_ptr() as *mut u8,
@@ -186,6 +191,10 @@ impl MetalBackend {
                 .ok_or_else(|| BackendError::Other("failed to create a compute encoder".into()))?;
 
             encoder.setComputePipelineState(&pipeline);
+            // SAFETY: the indices match `salt_iterate`'s parameter positions in
+            // kernels/metal/salt.metal, and both buffers plus `mode` and
+            // `params` outlive the command buffer, which is waited on before
+            // this iteration ends.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&results), 0, 0);
                 set_bytes(&encoder, &mode, 1);
@@ -231,6 +240,12 @@ impl MetalBackend {
 
 /// Push a small struct straight into the command encoder rather than
 /// allocating a buffer for it.
+///
+/// # Safety
+///
+/// `T` must have the layout the kernel expects at `index`, which means a
+/// `#[repr(C)]` type matching the corresponding parameter in
+/// kernels/metal/salt.metal.
 unsafe fn set_bytes<T>(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &T,
@@ -238,6 +253,9 @@ unsafe fn set_bytes<T>(
 ) {
     let ptr =
         NonNull::new(std::ptr::from_ref(value) as *mut c_void).expect("reference is never null");
+    // SAFETY: `ptr` points at `value`, which outlives the call, and the length
+    // is exactly its size. Metal copies the bytes into the command buffer, so
+    // the borrow does not have to outlive the encoding.
     unsafe { encoder.setBytes_length_atIndex(ptr, size_of::<T>(), index) };
 }
 
