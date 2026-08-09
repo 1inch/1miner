@@ -167,11 +167,11 @@ impl MetalBackend {
                 // flight and nothing else holds a reference to the storage.
                 unsafe {
                     std::ptr::write_bytes(
-                        results.contents().as_ptr() as *mut u8,
+                        results.contents().as_ptr().cast::<u8>(),
                         0,
                         SLOTS * size_of::<MtResult>(),
                     );
-                    std::ptr::write_bytes(flags.contents().as_ptr() as *mut u8, 0, SLOTS * 4);
+                    std::ptr::write_bytes(flags.contents().as_ptr().cast::<u8>(), 0, SLOTS * 4);
                 }
             }
 

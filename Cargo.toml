@@ -29,6 +29,38 @@ rand = "0.9"
 sha3 = "0.10"
 thiserror = "2"
 
+# A short list on purpose. Every lint here holds across the whole tree today, so
+# `cargo clippy -- -D warnings` is a gate rather than a wall of noise nobody
+# reads. Each crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+# An unsafe operation inside an unsafe fn still gets its own block, so the
+# SAFETY comment sits on the operation instead of covering the whole body.
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+# The reasoning for an unsafe block belongs where the block is. All 31 sites
+# carry one, and this keeps the next one from arriving bare.
+undocumented_unsafe_blocks = "warn"
+# A pointer cast that quietly changes more than the pointee type produces a
+# wrong address here rather than a crash.
+ptr_as_ptr = "warn"
+# A clone in a mining loop is exactly the cost no test would report.
+redundant_clone = "warn"
+
+# Deliberately absent, so nobody has to rediscover why:
+#
+# cast_possible_truncation is the highest-value lint for this codebase — a
+# truncating cast is audit finding M1 one level down, in the kernel — but it
+# fires at 35 sites and each needs a decision about whether the invariant
+# actually rules truncation out. That is its own change, not a line in this file.
+#
+# cast_lossless fires right through the secp256k1 field arithmetic, which is a
+# deliberate line-by-line port of profanity2's. Rewriting `a[i] as u128` there
+# would cost the diffability that makes the port checkable against the original.
+#
+# The pedantic group as a whole is 72 warnings, mostly missing_errors_doc and
+# must_use_candidate, which is how a team learns to ignore clippy output.
+
 [profile.release]
 opt-level = 3
 lto = true

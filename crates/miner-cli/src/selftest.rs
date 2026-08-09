@@ -128,7 +128,7 @@ fn planted_target(mode: MineMode, common: &CommonArgs) -> anyhow::Result<bool> {
     };
 
     let job = Job {
-        mode: ModeConfig::Salt(cfg.clone()),
+        mode: ModeConfig::Salt(cfg),
         score,
         keccak: common.keccak(),
         tuning: tuning.clone(),

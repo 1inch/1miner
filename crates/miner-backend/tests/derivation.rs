@@ -158,7 +158,7 @@ fn exact_mode_reports_repeated_full_matches() {
     let needed = spec.constrained_bytes();
 
     let job = Job {
-        mode: ModeConfig::Salt(cfg.clone()),
+        mode: ModeConfig::Salt(cfg),
         score: spec,
         keccak: KeccakVariant::Tuned,
         tuning: Tuning {

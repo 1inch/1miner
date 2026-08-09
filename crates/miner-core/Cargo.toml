@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Address derivation, scoring and mode configuration shared by all 1miner backends"
 
+[lints]
+workspace = true
+
 [dependencies]
 hex.workspace = true
 sha3.workspace = true

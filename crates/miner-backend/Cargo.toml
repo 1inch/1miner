@@ -12,6 +12,9 @@ default = ["opencl"]
 opencl = ["dep:opencl3"]
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
 
+[lints]
+workspace = true
+
 [dependencies]
 miner-core.workspace = true
 hex.workspace = true

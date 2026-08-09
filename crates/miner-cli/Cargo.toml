@@ -16,6 +16,9 @@ default = ["opencl"]
 opencl = ["miner-backend/opencl"]
 metal = ["miner-backend/metal"]
 
+[lints]
+workspace = true
+
 [dependencies]
 miner-core.workspace = true
 miner-backend.workspace = true
