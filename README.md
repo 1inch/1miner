@@ -30,7 +30,8 @@ cargo build --release --features metal   # plus the macOS Metal backend
 1miner 1nft --deployer 0xDeployer --mint-for 0xYourAccount --zero-bytes
 
 # A vanity account address, without ever handing over a private key.
-1miner profanity --public-key <128 hex chars> --leading 0
+eval "$(scripts/profanity-keygen.sh)"    # a seed keypair, made here and kept here
+1miner profanity --public-key "$PROFANITY_PUBKEY" --leading 0
 
 # Report every address matching a mask in full, instead of climbing to a best score.
 1miner create3 --deployer 0xFactory --exact deadbeef
@@ -40,7 +41,7 @@ Every mode guide ends with how to turn the result into a deployed contract or a 
 
 ## Safety
 
-`profanity` mode never accepts a private key. You generate a keypair offline, pass only the public key, and the miner reports an **offset**. Adding that offset to your seed private key gives the private key for the found address, so the search itself can run on a machine you do not control. See [docs/modes/profanity.md](docs/modes/profanity.md).
+`profanity` mode never accepts a private key. You generate a keypair offline, pass only the public key, and the miner reports an **offset**. Adding that offset to your seed private key gives the private key for the found address, so the search itself can run on a machine you do not control. `scripts/profanity-keygen.sh` makes the keypair and `scripts/profanity-final-key.sh` does the addition, checking the result against the address that was mined. See [docs/modes/profanity.md](docs/modes/profanity.md).
 
 Every reported hit is re-derived on the CPU before it is printed. If the kernel and the reference ever disagree, the hit is flagged and the process exits non-zero rather than handing you an address that does not exist. Disable with `--no-verify` only if you have a reason to.
 

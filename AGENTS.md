@@ -11,7 +11,7 @@ crates/miner-cli/      clap surface, terminal output, self-test.
 kernels/opencl/        keccak_tuned.cl, keccak_plain.cl, salt.cl, profanity.cl
 kernels/metal/         salt.metal
 docs/                  user and contributor documentation.
-scripts/bench.sh       benchmark harness.
+scripts/               bench.sh benchmark harness; profanity-keygen.sh and profanity-final-key.sh, the seed keypair and the offset-to-key step.
 references/            upstream C++ miners (profanity2, ERADICATE2/3). Gitignored, read-only.
 ```
 
