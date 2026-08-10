@@ -232,6 +232,21 @@ impl Progress {
     }
 }
 
+/// Split a launch of `total` work items into pieces of at most `work_max`,
+/// yielding the offset and the count of each.
+///
+/// Every backend splits its enqueues, as the reference dispatcher does, and
+/// each piece has to say where it starts: OpenCL passes the offset as a global
+/// work offset and Metal adds it to `thread_position_in_grid` itself. An
+/// off-by-one here is a work item run twice or skipped rather than an error, so
+/// there is one implementation and one test of it.
+pub fn chunks(total: usize, work_max: usize) -> impl Iterator<Item = (usize, usize)> {
+    let step = work_max.max(1);
+    (0..total)
+        .step_by(step)
+        .map(move |offset| (offset, step.min(total - offset)))
+}
+
 /// Report everything a queue has gained past `from`, returning the new mark.
 ///
 /// The queue is a watermark rather than something emptied: a backend appends
@@ -281,4 +296,35 @@ pub trait Backend {
         reporter: &mut dyn Reporter,
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chunked launch has to cover every work item exactly once, and each
+    /// chunk has to say where it starts. An off-by-one here is an offset that
+    /// names the wrong address.
+    #[test]
+    fn chunks_tile_the_launch_without_gaps_or_overlap() {
+        for (total, work_max) in [(10, 3), (10, 10), (10, 100), (1, 1), (255, 64)] {
+            let pieces: Vec<_> = chunks(total, work_max).collect();
+            let mut covered = 0;
+            for (offset, run) in &pieces {
+                assert_eq!(*offset, covered, "chunk starts in the wrong place");
+                covered += run;
+            }
+            assert_eq!(covered, total, "chunks did not cover the launch");
+            assert!(pieces.iter().all(|(_, run)| *run <= work_max));
+        }
+    }
+
+    /// A zero width would divide the launch into nothing at all, and
+    /// `step_by(0)` panics. Callers clamp already; this keeps the one
+    /// implementation from depending on that.
+    #[test]
+    fn a_zero_width_still_covers_the_launch() {
+        assert_eq!(chunks(3, 0).collect::<Vec<_>>(), [(0, 1), (1, 1), (2, 1)]);
+        assert_eq!(chunks(0, 8).count(), 0);
+    }
 }

@@ -35,6 +35,9 @@ use crate::{Backend, BackendError, DeviceInfo, Job, ModeConfig, Reporter, Result
 /// hit is printed.
 const PIPELINE: usize = 2;
 
+/// Slots in one result buffer, and so in the flag buffer beside it.
+const SLOTS: usize = crate::RESULT_SLOTS;
+
 /// The prelude every Metal library starts with. `METAL_KECCAK` carries the
 /// `#include` and so has to come first.
 fn library_source(kernel: &str) -> String {

@@ -19,14 +19,14 @@ use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
 
-use super::{DeviceId, DeviceRun, build_program, cl_err, enumerate_devices, run_devices};
+use super::{DeviceId, DeviceRun, buffer, build_program, cl_err, enumerate_devices, run_devices};
 use crate::profanity::{
     MpNumber, MpPoint, ResultSlot, RoundContext, be_bytes_to_ulong4, check_offset_fields,
-    device_seed, precomp_table,
+    device_seed, init_chunk, precomp_table,
 };
 use crate::{
     Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
-    RESULT_SLOTS, Reporter, Result, kernels,
+    RESULT_SLOTS, Reporter, Result, chunks, kernels,
 };
 
 pub struct ProfanityBackend {
@@ -175,63 +175,17 @@ fn run_device(
 
     let size = job.tuning.profanity_round_size();
 
-    // SAFETY: every allocation below passes a null host pointer with neither
-    // CL_MEM_USE_HOST_PTR nor CL_MEM_COPY_HOST_PTR, so OpenCL owns the storage
-    // and no host lifetime has to be upheld. This applies to all seven.
-    let mut mem_precomp = unsafe {
-        Buffer::<MpPoint>::create(
-            &context,
-            CL_MEM_READ_ONLY,
-            precomp.len(),
-            std::ptr::null_mut(),
-        )
-    }
-    .map_err(cl_err("failed to allocate precomp buffer"))?;
-    // SAFETY: as above.
-    let mem_delta_x = unsafe {
-        Buffer::<MpNumber>::create(&context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
-    }
-    .map_err(cl_err("failed to allocate deltaX buffer"))?;
-    // SAFETY: as above.
-    let mem_inversed = unsafe {
-        Buffer::<MpNumber>::create(&context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
-    }
-    .map_err(cl_err("failed to allocate inverse buffer"))?;
-    // SAFETY: as above.
-    let mem_prev_lambda = unsafe {
-        Buffer::<MpNumber>::create(&context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
-    }
-    .map_err(cl_err("failed to allocate lambda buffer"))?;
-    // SAFETY: as above.
-    let mut mem_result = unsafe {
-        Buffer::<ResultSlot>::create(
-            &context,
-            CL_MEM_READ_WRITE,
-            RESULT_SLOTS,
-            std::ptr::null_mut(),
-        )
-    }
-    .map_err(cl_err("failed to allocate result buffer"))?;
-    // SAFETY: as above.
-    let mut mem_data1 = unsafe {
-        Buffer::<cl_uchar>::create(
-            &context,
-            CL_MEM_READ_ONLY,
-            data1.len(),
-            std::ptr::null_mut(),
-        )
-    }
-    .map_err(cl_err("failed to allocate data1"))?;
-    // SAFETY: as above.
-    let mut mem_data2 = unsafe {
-        Buffer::<cl_uchar>::create(
-            &context,
-            CL_MEM_READ_ONLY,
-            data2.len(),
-            std::ptr::null_mut(),
-        )
-    }
-    .map_err(cl_err("failed to allocate data2"))?;
+    let mut mem_precomp: Buffer<MpPoint> =
+        buffer(&context, CL_MEM_READ_ONLY, precomp.len(), "precomp")?;
+    // The three the round works in, 32 bytes per work item each: about 400 MB
+    // at the default tuning, which is why these are the ones that fail.
+    let mem_delta_x: Buffer<MpNumber> = buffer(&context, CL_MEM_READ_WRITE, size, "deltaX")?;
+    let mem_inversed: Buffer<MpNumber> = buffer(&context, CL_MEM_READ_WRITE, size, "inverse")?;
+    let mem_prev_lambda: Buffer<MpNumber> = buffer(&context, CL_MEM_READ_WRITE, size, "lambda")?;
+    let mut mem_result: Buffer<ResultSlot> =
+        buffer(&context, CL_MEM_READ_WRITE, RESULT_SLOTS, "result")?;
+    let mut mem_data1: Buffer<cl_uchar> = buffer(&context, CL_MEM_READ_ONLY, data1.len(), "data1")?;
+    let mut mem_data2: Buffer<cl_uchar> = buffer(&context, CL_MEM_READ_ONLY, data2.len(), "data2")?;
 
     let mut results = vec![ResultSlot::default(); RESULT_SLOTS];
     // SAFETY: all four writes are blocking, so each source only has to be live
@@ -262,10 +216,7 @@ fn run_device(
 
     // Seeding touches every element of the three scratch buffers, so it is
     // chunked to keep individual enqueues small.
-    let init_chunk = (size / 20).clamp(1, work_max);
-    let mut initialized = 0usize;
-    while initialized < size {
-        let run = init_chunk.min(size - initialized);
+    for (offset, run) in chunks(size, init_chunk(size, work_max)) {
         // SAFETY: the argument types and their order match `profanity_init`'s
         // parameters in kernels/opencl/profanity.cl, and every buffer and scalar
         // passed outlives the enqueue, which is drained by the flush below and
@@ -279,13 +230,12 @@ fn run_device(
                 .set_arg(&seed)
                 .set_arg(&seed_x)
                 .set_arg(&seed_y)
-                .set_global_work_offset(initialized)
+                .set_global_work_offset(offset)
                 .set_global_work_size(run)
                 .enqueue_nd_range(&queue)
                 .map_err(cl_err("profanity_init failed"))?;
         }
         queue.flush().map_err(cl_err("flush failed"))?;
-        initialized += run;
     }
     queue.finish().map_err(cl_err("initialization failed"))?;
 
@@ -418,9 +368,7 @@ fn enqueue_chunked(
     local: usize,
     set_args: impl Fn(&mut ExecuteKernel),
 ) -> Result<()> {
-    let mut offset = 0usize;
-    while offset < total {
-        let run = work_max.min(total - offset);
+    for (offset, run) in chunks(total, work_max) {
         // SAFETY: binding the arguments belongs to `set_args`, and each call
         // site states its own case; what this block adds is the work-item range,
         // where `offset + run` never exceeds `total`.
@@ -435,7 +383,6 @@ fn enqueue_chunked(
             exec.enqueue_nd_range(queue)
                 .map_err(cl_err("kernel enqueue failed"))?;
         }
-        offset += run;
     }
     Ok(())
 }

@@ -86,6 +86,18 @@ pub fn precomp_table() -> Vec<MpPoint> {
         .collect()
 }
 
+/// Enqueues the seeding pass is split into.
+///
+/// Seeding walks the precomp table with a full modular inversion per point
+/// added, orders of magnitude more work per item than a round. Left as one
+/// launch it can run long enough for a GPU watchdog to take it for a hang.
+const INIT_CHUNKS: usize = 20;
+
+/// How wide one seeding enqueue may be, given the round size and `--work-max`.
+pub fn init_chunk(size: usize, work_max: usize) -> usize {
+    (size / INIT_CHUNKS).clamp(1, work_max)
+}
+
 /// The most significant lane of an offset is a packed field. From the top: 16
 /// bits left clear so `seed_priv + offset` cannot overflow 256 bits, 16 bits of
 /// device slot, and 32 bits the kernel adds the work-item id into.

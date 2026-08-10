@@ -614,6 +614,61 @@ fn ordinary_scoring_reports_only_improvements() {
     }
 }
 
+/// A round split by `--work-max` has to keep reaching new work items.
+///
+/// Each chunk carries its own offset, which OpenCL passes as a global work
+/// offset and Metal adds to the thread position itself. Losing it re-mines the
+/// first chunk's ids for every chunk: the hashrate is unchanged, every address
+/// reported is real, and the search covers a fraction of the ground it claims.
+/// The target below sits well past the first chunk, so only a launch that
+/// advances can find it.
+fn a_chunked_round_reaches_a_later_work_item(open: impl Fn() -> Box<dyn Backend>, label: &str) {
+    const TARGET_GID: u32 = 4_242;
+    const ROUND: u32 = 1;
+    const CHUNK: usize = 1024;
+
+    let cfg = config(MineMode::Create2);
+    let target_salt = cfg.salt_at(0, TARGET_GID, ROUND);
+    let target = cfg.address_for_salt(&target_salt);
+    assert!(
+        TARGET_GID as usize > CHUNK,
+        "the target has to lie beyond the first chunk for this to test anything"
+    );
+
+    let job = Job {
+        mode: ModeConfig::Salt(cfg),
+        score: ScoreSpec::matching(&hex::encode(target)).unwrap(),
+        keccak: KeccakVariant::Tuned,
+        tuning: Tuning {
+            round_size: 1 << 16,
+            work_max: Some(CHUNK),
+            work_size: 64,
+            no_cache: true,
+            ..Tuning::default()
+        },
+        duration: Some(Duration::from_secs(20)),
+        verify: true,
+        exact: None,
+    };
+
+    let hits = run_until(&mut *open(), &job, 20);
+    let best = hits.iter().max_by_key(|h| h.score);
+    assert_eq!(
+        best.map(|hit| hit.score),
+        Some(20),
+        "{label}: a round in {CHUNK}-wide chunks never reached work item {TARGET_GID}"
+    );
+    assert_eq!(
+        best.and_then(|hit| hit.salt),
+        Some(target_salt),
+        "{label}: wrong salt"
+    );
+    assert!(
+        best.is_some_and(|hit| hit.verified),
+        "{label}: hit failed CPU re-derivation"
+    );
+}
+
 /// Every scoring function a kernel implements, scored on the device and scored
 /// again on the CPU.
 ///
@@ -791,6 +846,17 @@ mod opencl {
     /// writes, so the salt in the slot belongs to one and the address to
     /// another and re-derivation disagrees.
     #[test]
+    fn opencl_chunked_round_reaches_a_later_work_item() {
+        if backend().is_none() {
+            return;
+        }
+        a_chunked_round_reaches_a_later_work_item(
+            || backend().expect("a device was present a moment ago"),
+            "opencl",
+        );
+    }
+
+    #[test]
     fn opencl_scores_every_function_as_the_cpu_does() {
         if backend().is_none() {
             return;
@@ -914,6 +980,17 @@ mod metal {
             let Some(b) = backend() else { return };
             planted_target(b, mode, 1 << 16);
         }
+    }
+
+    #[test]
+    fn metal_chunked_round_reaches_a_later_work_item() {
+        if backend().is_none() {
+            return;
+        }
+        a_chunked_round_reaches_a_later_work_item(
+            || backend().expect("a device was present a moment ago"),
+            "metal",
+        );
     }
 
     #[test]

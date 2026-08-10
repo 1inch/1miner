@@ -21,19 +21,15 @@ use objc2_metal::{
 };
 
 use super::{
-    CommandBuffer, MetalBackend, PIPELINE, clear, dispatch, encode, read_counter, read_slots,
-    set_bytes, set_slice, threadgroup_width,
+    CommandBuffer, MetalBackend, PIPELINE, SLOTS, clear, dispatch, encode, read_counter,
+    read_slots, set_bytes, set_slice, threadgroup_width,
 };
 use crate::profanity::{
     MpNumber, MpPoint, ResultSlot, RoundContext, Ulong4, be_bytes_to_ulong4, check_offset_fields,
-    device_seed, precomp_table,
+    device_seed, init_chunk, precomp_table,
 };
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{
-    BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels, wire,
-};
-
-const SLOTS: usize = RESULT_SLOTS;
+use crate::{BackendError, EXACT_CAPACITY, Job, Progress, Reporter, Result, chunks, kernels, wire};
 
 /// Matches `ProfParams` in kernels/metal/profanity.metal.
 ///
@@ -157,15 +153,12 @@ impl MetalBackend {
         // round. Left as one dispatch it can run long enough for the GPU
         // watchdog to take it for a hang, so it is chunked as the OpenCL path
         // chunks its enqueues.
-        let init_chunk = (size / 20).clamp(1, work_max);
         let init_group = threadgroup_width(&init, job.tuning.work_size);
-        let mut initialized = 0usize;
-        while initialized < size {
+        for (offset, run) in chunks(size, init_chunk(size, work_max)) {
             if should_stop() {
                 return Ok(());
             }
-            let run = init_chunk.min(size - initialized);
-            params.id_base = initialized as u32;
+            params.id_base = offset as u32;
 
             let (command_buffer, encoder) = encode(&queue)?;
             encoder.setComputePipelineState(&init);
@@ -182,8 +175,6 @@ impl MetalBackend {
             encoder.endEncoding();
             command_buffer.commit();
             command_buffer.waitUntilCompleted();
-
-            initialized += run;
         }
 
         let inverse_group = threadgroup_width(&inverse, job.tuning.work_size);
@@ -386,14 +377,6 @@ impl Rounds<'_> {
     }
 }
 
-/// Split a launch into `work_max` sized pieces, as the OpenCL dispatcher does.
-/// Each piece needs its own `id_base`, which is the offset returned here.
-fn chunks(total: usize, work_max: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..total)
-        .step_by(work_max)
-        .map(move |offset| (offset, work_max.min(total - offset)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,22 +385,5 @@ mod tests {
     fn the_params_layout_matches_the_kernel() {
         // Three sets of four lanes, then six 32-bit fields.
         assert_eq!(size_of::<MtProfParams>(), 96 + 24);
-    }
-
-    /// A chunked launch has to cover every work item exactly once, and each
-    /// chunk has to say where it starts. An off-by-one here is an offset that
-    /// names the wrong address.
-    #[test]
-    fn chunks_tile_the_launch_without_gaps_or_overlap() {
-        for (total, work_max) in [(10, 3), (10, 10), (10, 100), (1, 1), (255, 64)] {
-            let pieces: Vec<_> = chunks(total, work_max).collect();
-            let mut covered = 0;
-            for (offset, run) in &pieces {
-                assert_eq!(*offset, covered, "chunk starts in the wrong place");
-                covered += run;
-            }
-            assert_eq!(covered, total, "chunks did not cover the launch");
-            assert!(pieces.iter().all(|(_, run)| *run <= work_max));
-        }
     }
 }

@@ -17,12 +17,13 @@ use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
 
 use super::{
-    DeviceId, DeviceRun, build_program, cl_err, enumerate_devices, run_devices, state_define,
+    DeviceId, DeviceRun, buffer, build_program, cl_err, enumerate_devices, run_devices,
+    state_define,
 };
 use crate::salt::{SaltRound, SaltSlot};
 use crate::{
     Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
-    RESULT_SLOTS, Reporter, Result, kernels, wire,
+    RESULT_SLOTS, Reporter, Result, chunks, kernels, wire,
 };
 
 /// The scoring mode and the exact masks are different shapes bound to the same
@@ -146,18 +147,8 @@ fn run_device(
     };
     let kernel = Kernel::create(&program, kernel_name).map_err(cl_err("missing iterate kernel"))?;
 
-    // SAFETY: a null host pointer with neither CL_MEM_USE_HOST_PTR nor
-    // CL_MEM_COPY_HOST_PTR set asks OpenCL to own the allocation, so there is no
-    // host memory whose lifetime has to be upheld here.
-    let mut result_buf = unsafe {
-        Buffer::<SaltSlot>::create(
-            &context,
-            CL_MEM_READ_WRITE,
-            RESULT_SLOTS,
-            std::ptr::null_mut(),
-        )
-    }
-    .map_err(cl_err("failed to allocate result buffer"))?;
+    let mut result_buf: Buffer<SaltSlot> =
+        buffer(&context, CL_MEM_READ_WRITE, RESULT_SLOTS, "result")?;
 
     // One mode for scoring, or the masks for --exact. Both are read-only and
     // uploaded once, so they share a buffer slot in the kernel's arguments.
@@ -169,10 +160,7 @@ fn run_device(
         (bytes_of(&modes), size_of::<wire::Mode>())
     };
 
-    // SAFETY: as above, OpenCL owns the allocation.
-    let mut mode_buf =
-        unsafe { Buffer::<u8>::create(&context, CL_MEM_READ_ONLY, mode_len, std::ptr::null_mut()) }
-            .map_err(cl_err("failed to allocate mode buffer"))?;
+    let mut mode_buf: Buffer<u8> = buffer(&context, CL_MEM_READ_ONLY, mode_len, "mode")?;
 
     let mut results = vec![SaltSlot::default(); RESULT_SLOTS];
     // SAFETY: both writes are blocking, so the source slices only have to be
@@ -232,9 +220,7 @@ fn run_device(
         }
 
         round = round.wrapping_add(1);
-        let mut offset = 0usize;
-        while offset < round_size {
-            let this = chunk.min(round_size - offset);
+        for (offset, this) in chunks(round_size, chunk) {
             // SAFETY: the argument types and their order match the parameters
             // of whichever kernel `kernel_name` selected in
             // kernels/opencl/salt.cl — the third differs between them, and is
@@ -262,7 +248,6 @@ fn run_device(
                 exec.enqueue_nd_range(&queue)
                     .map_err(cl_err("failed to enqueue salt_iterate"))?;
             }
-            offset += this;
         }
         queue.flush().map_err(cl_err("flush failed"))?;
         read_event.wait().map_err(cl_err("result read failed"))?;

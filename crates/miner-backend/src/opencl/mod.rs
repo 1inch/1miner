@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use opencl3::context::Context;
 use opencl3::device::{CL_DEVICE_TYPE_GPU, Device, get_all_devices};
+use opencl3::memory::Buffer;
 use opencl3::program::Program;
-use opencl3::types::cl_device_id;
+use opencl3::types::{cl_device_id, cl_mem_flags};
 
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{BackendError, DeviceInfo, Job, Progress, Reporter, Result, drain_hits};
@@ -74,6 +75,24 @@ pub fn enumerate_devices(skip: &[usize]) -> Result<Vec<(DeviceId, DeviceInfo)>> 
         return Err(BackendError::NoDevices("opencl"));
     }
     Ok(out)
+}
+
+/// Allocate a buffer of `len` elements that OpenCL owns.
+///
+/// `what` names it in the error, since a device that cannot fit an allocation
+/// should say which one, and the scratch buffers a profanity round works in are
+/// the ones large enough to fail.
+pub(crate) fn buffer<T>(
+    context: &Context,
+    flags: cl_mem_flags,
+    len: usize,
+    what: &str,
+) -> Result<Buffer<T>> {
+    // SAFETY: a null host pointer with neither CL_MEM_USE_HOST_PTR nor
+    // CL_MEM_COPY_HOST_PTR set asks OpenCL to own the allocation, so there is no
+    // host memory whose lifetime has to be upheld here.
+    unsafe { Buffer::<T>::create(context, flags, len, std::ptr::null_mut()) }
+        .map_err(|e| BackendError::OpenCl(format!("failed to allocate the {what} buffer: {e:?}")))
 }
 
 fn cache_dir() -> Option<PathBuf> {

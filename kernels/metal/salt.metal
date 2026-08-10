@@ -14,6 +14,10 @@ struct Params {
     ulong state[25];   // CREATE2 pre-image plus the leading keccak pad bit
     uint  deviceIndex;
     uint  round;
+    // Added to thread_position_in_grid. Metal has no equivalent of OpenCL's
+    // global work offset, so without this a round split into chunks would start
+    // every chunk's ids at zero and mine the same salts over again.
+    uint  idBase;
     uint  secondHash;  // 1 for create3 and 1nft
     uint  scoreMax;
     uint  patternCount;   // --exact only
@@ -95,7 +99,7 @@ kernel void salt_iterate(
 {
     uchar salt[32];
     uchar address[20];
-    salt_derive(params, gid, salt, address);
+    salt_derive(params, gid + params.idBase, salt, address);
 
     int score = score_address(address, mode);
     if (score <= 0 || (uint)score <= params.scoreMax) {
@@ -136,7 +140,7 @@ kernel void salt_iterate_exact(
 {
     uchar salt[32];
     uchar address[20];
-    salt_derive(params, gid, salt, address);
+    salt_derive(params, gid + params.idBase, salt, address);
 
     for (uint p = 0; p < params.patternCount; ++p) {
         if (!matches_pattern(address, patterns[p])) {

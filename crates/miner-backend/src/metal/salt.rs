@@ -11,14 +11,12 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
 use super::{
-    CommandBuffer, MetalBackend, PIPELINE, clear, dispatch, encode, read_counter, read_slots,
-    set_bytes, set_slice, threadgroup_width,
+    CommandBuffer, MetalBackend, PIPELINE, SLOTS, clear, dispatch, encode, read_counter,
+    read_slots, set_bytes, set_slice, threadgroup_width,
 };
 use crate::salt::{SaltRound, SaltSlot};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels, wire};
-
-const SLOTS: usize = RESULT_SLOTS;
+use crate::{EXACT_CAPACITY, Job, Progress, Reporter, Result, chunks, kernels, wire};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,6 +24,10 @@ struct MtParams {
     state: [u64; 25],
     device_index: u32,
     round: u32,
+    /// Added to `thread_position_in_grid`, since Metal has no equivalent of
+    /// OpenCL's global work offset: without it a round split by `--work-max`
+    /// would start every chunk's ids at zero and mine the same salts again.
+    id_base: u32,
     second_hash: u32,
     score_max: u32,
     pattern_count: u32,
@@ -69,6 +71,10 @@ impl MetalBackend {
         let patterns = wire::patterns(job.exact.as_deref());
 
         let threadgroup = threadgroup_width(&pipeline, job.tuning.work_size);
+        let work_max = job.tuning.work_max.unwrap_or(job.tuning.round_size).max(1);
+        // The pre-image is fixed for the whole run; only the three work-item
+        // words move, and the kernel is what moves them.
+        let state = cfg.state_words();
         let reader = SaltRound {
             cfg,
             job,
@@ -113,10 +119,11 @@ impl MetalBackend {
                 clear(&flags[slot]);
             }
 
-            let params = MtParams {
-                state: cfg.state_words(),
+            let mut params = MtParams {
+                state,
                 device_index: 0,
                 round,
+                id_base: 0,
                 second_hash: cfg.mode.needs_second_hash().into(),
                 // Two rounds behind rather than one, since the round in flight
                 // has not been read yet. The bar only suppresses writes the
@@ -128,23 +135,26 @@ impl MetalBackend {
 
             let (command_buffer, encoder) = encode(&queue)?;
             encoder.setComputePipelineState(&pipeline);
-            // SAFETY: the indices match `salt_iterate`'s parameter positions in
-            // kernels/metal/salt.metal, and both buffers plus `mode` and
-            // `params` outlive the command buffer, which is waited on before
-            // this function returns.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&results[slot]), 0, 0);
-                // Buffer 1 is the scoring mode or the exact masks, chosen
-                // alongside the kernel name above.
-                if job.is_exact() {
-                    set_slice(&encoder, &patterns, 1);
-                } else {
-                    set_bytes(&encoder, &mode, 1);
+            for (offset, run) in chunks(job.tuning.round_size, work_max) {
+                params.id_base = offset as u32;
+                // SAFETY: the indices match `salt_iterate`'s parameter positions
+                // in kernels/metal/salt.metal, and both buffers plus `mode` and
+                // `params` outlive the command buffer, which is waited on
+                // before this function returns.
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&results[slot]), 0, 0);
+                    // Buffer 1 is the scoring mode or the exact masks, chosen
+                    // alongside the kernel name above.
+                    if job.is_exact() {
+                        set_slice(&encoder, &patterns, 1);
+                    } else {
+                        set_bytes(&encoder, &mode, 1);
+                    }
+                    set_bytes(&encoder, &params, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&flags[slot]), 0, 3);
                 }
-                set_bytes(&encoder, &params, 2);
-                encoder.setBuffer_offset_atIndex(Some(&flags[slot]), 0, 3);
+                dispatch(&encoder, run, threadgroup);
             }
-            dispatch(&encoder, job.tuning.round_size, threadgroup);
             encoder.endEncoding();
             command_buffer.commit();
 
@@ -227,7 +237,8 @@ mod tests {
 
     #[test]
     fn the_params_layout_matches_the_kernel() {
-        // 25 lanes plus six 32-bit fields.
-        assert_eq!(size_of::<MtParams>(), 200 + 24);
+        // 25 lanes, then seven 32-bit fields, then four bytes of tail padding
+        // to the lanes' own alignment, which both compilers add.
+        assert_eq!(size_of::<MtParams>(), 200 + 28 + 4);
     }
 }
