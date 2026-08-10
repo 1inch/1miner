@@ -10,17 +10,28 @@
 # Rust-versus-C++ decision the first measurement put Rust 22% ahead purely
 # because it ran first on a cold GPU.
 #
+# A cooldown between runs is not on its own enough. Measured on an M4 Max, a
+# 30-second cooldown left create3 1.4% below its settled rate with three times
+# the spread, and a benchmark started straight after a heavy GPU session read
+# 284 MH/s where the settled figure was 363 — then climbed over the next three
+# passes rather than falling. Alternating order cancels a drift that runs one
+# way; it cannot cancel a machine still recovering from whatever ran before the
+# benchmark. Hence a 60-second cooldown, and -x: whole passes run and thrown
+# away before the first one that counts.
+#
 # Usage:
 #   scripts/bench.sh [-m MODE] [-b BACKENDS] [-k KERNELS] [-p PASSES]
-#                    [-w WARMUP] [-d MEASURE] [-c COOLDOWN] [-o FILE]
+#                    [-w WARMUP] [-d MEASURE] [-c COOLDOWN] [-x DISCARDED]
+#                    [-o FILE]
 #
 #   -m  mode: create2 | create3 | 1nft | profanity          (default create3)
 #   -b  space-separated backends                            (default "opencl")
 #   -k  space-separated kernel variants                     (default "tuned")
 #   -p  passes per contender                                (default 2)
-#   -w  warmup seconds, discarded                           (default 10)
+#   -w  warmup seconds, discarded within each run           (default 10)
 #   -d  measured seconds                                    (default 20)
-#   -c  cooldown seconds before each run                    (default 30)
+#   -c  cooldown seconds before each run                    (default 60)
+#   -x  whole passes run and thrown away first              (default 1)
 #   -o  also append a markdown table row per result to FILE
 #
 # Examples:
@@ -35,10 +46,15 @@ KERNELS="tuned"
 PASSES=2
 WARMUP=10
 MEASURE=20
-COOLDOWN=30
+COOLDOWN=60
+DISCARD=1
 OUTFILE=""
 
-while getopts "m:b:k:p:w:d:c:o:h" opt; do
+# Pass-to-pass spread above this share of the mean, as a percentage, means the
+# figures describe the machine's thermal state rather than the contenders.
+DRIFT=3
+
+while getopts "m:b:k:p:w:d:c:x:o:h" opt; do
     case "$opt" in
         m) MODE=$OPTARG ;;
         b) BACKENDS=$OPTARG ;;
@@ -47,8 +63,11 @@ while getopts "m:b:k:p:w:d:c:o:h" opt; do
         w) WARMUP=$OPTARG ;;
         d) MEASURE=$OPTARG ;;
         c) COOLDOWN=$OPTARG ;;
+        x) DISCARD=$OPTARG ;;
         o) OUTFILE=$OPTARG ;;
-        h) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # The comment block above, however long it grows. A fixed line range
+        # went stale the first time a line was added to it.
+        h) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "try -h" >&2; exit 2 ;;
     esac
 done
@@ -116,9 +135,31 @@ for backend in $BACKENDS; do
     done
 done
 
-echo "mode=$MODE  warmup=${WARMUP}s  measured=${MEASURE}s  cooldown=${COOLDOWN}s  passes=$PASSES"
+echo "mode=$MODE  warmup=${WARMUP}s  measured=${MEASURE}s  cooldown=${COOLDOWN}s  discarded=$DISCARD  passes=$PASSES"
 echo "contenders:$CONTENDERS"
 echo
+
+# Whole passes thrown away, to put the machine in the state the measured passes
+# will run in. This is not what -w does: -w discards the first seconds inside a
+# single run, which cannot escape a thermal state that takes minutes to leave.
+# Their figures are printed rather than hidden, because how far they sit from the
+# measured ones is the evidence that the cooldown is long enough.
+discarded=1
+while [ "$discarded" -le "$DISCARD" ]; do
+    echo "discarded pass $discarded"
+    for c in $CONTENDERS; do
+        sleep "$COOLDOWN"
+        printf "  %-16s " "$c"
+        speed=$(measure "${c%%:*}" "${c##*:}")
+        if [ -z "$speed" ]; then
+            echo "FAILED (no speed reported)"
+        else
+            echo "$speed MH/s (discarded)"
+        fi
+    done
+    echo
+    discarded=$((discarded + 1))
+done
 
 RESULTS=""
 pass=1
@@ -156,19 +197,48 @@ for c in $CONTENDERS; do
     spread=$(printf '%s' "$RESULTS" | awk -v key="$c" '
         $1 == key { if (n == 0 || $2 < lo) lo = $2; if ($2 > hi) hi = $2; n += 1 }
         END { if (n > 1) printf " (min %.3f, max %.3f)", lo, hi }')
-    [ -n "$mean" ] && printf "  %-16s %s MH/s%s\n" "$c" "$mean" "$spread"
+    if [ -n "$mean" ]; then
+        printf "  %-16s %s MH/s%s\n" "$c" "$mean" "$spread"
+    fi
 done
+
+# Printing the spread is not the same as saying it is too wide to mean anything.
+# "322.771 MH/s (min 284.543, max 346.768)" is not a result, and without this it
+# is reported in exactly the shape of one.
+drifted=""
+for c in $CONTENDERS; do
+    pct=$(printf '%s' "$RESULTS" | awk -v key="$c" '
+        $1 == key { s += $2; n += 1; if (n == 1 || $2 < lo) lo = $2; if (n == 1 || $2 > hi) hi = $2 }
+        END { if (n > 1 && s > 0) printf "%.1f", (hi - lo) * 100 * n / s }')
+    if [ -n "$pct" ] && awk "BEGIN { exit !($pct > $DRIFT) }"; then
+        drifted="$drifted $c ($pct%)"
+    fi
+done
+if [ -n "$drifted" ]; then
+    echo
+    echo "warning: pass-to-pass spread above ${DRIFT}% for:$drifted" >&2
+    echo "  Thermal drift is deciding these numbers, not the contenders. Raise -c" >&2
+    echo "  (cooldown, now ${COOLDOWN}s) and -x (discarded passes, now $DISCARD)," >&2
+    echo "  then re-run before quoting anything above." >&2
+fi
 
 if [ -n "$OUTFILE" ]; then
     # Record what the number depends on. An unlabelled hashrate is not
-    # reproducible: driver releases move it.
+    # reproducible: driver releases move it, and so does the procedure, so the
+    # flags that produced the figure go in the row beside it.
     host=$(uname -sm)
     stamp=$(date -u '+%Y-%m-%d')
-    [ -f "$OUTFILE" ] || printf '| date | host | mode | backend | kernel | MH/s |\n| --- | --- | --- | --- | --- | --- |\n' > "$OUTFILE"
+    flags="-w $WARMUP -d $MEASURE -c $COOLDOWN -x $DISCARD -p $PASSES"
+    [ -f "$OUTFILE" ] || printf '| date | host | mode | backend | kernel | MH/s | min-max | flags |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n' > "$OUTFILE"
     for c in $CONTENDERS; do
         mean=$(printf '%s' "$RESULTS" | awk -v key="$c" '$1 == key { s += $2; n += 1 } END { if (n) printf "%.3f", s / n }')
-        [ -n "$mean" ] && printf '| %s | %s | %s | %s | %s | %s |\n' \
-            "$stamp" "$host" "$MODE" "${c%%:*}" "${c##*:}" "$mean" >> "$OUTFILE"
+        range=$(printf '%s' "$RESULTS" | awk -v key="$c" '
+            $1 == key { n += 1; if (n == 1 || $2 < lo) lo = $2; if (n == 1 || $2 > hi) hi = $2 }
+            END { if (n > 1) printf "%.3f-%.3f", lo, hi }')
+        if [ -n "$mean" ]; then
+            printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+                "$stamp" "$host" "$MODE" "${c%%:*}" "${c##*:}" "$mean" "${range:--}" "$flags" >> "$OUTFILE"
+        fi
     done
     echo
     echo "appended to $OUTFILE"

@@ -29,12 +29,38 @@ scripts/bench.sh -m create2 -b "opencl metal" -o bench-results.md
 
 What it does, and what to reproduce if you measure by hand:
 
-- **Cools down before every run.** `-c`, default 30 seconds idle.
+- **Cools down before every run.** `-c`, default 60 seconds idle.
+- **Throws away whole passes first.** `-x`, default one. Their figures are printed and then ignored. This is not the same thing as `-w`; see [the cooldown is not the whole problem](#the-cooldown-is-not-the-whole-problem) below.
 - **Excludes a warmup from the figure.** `-w`, default 10 seconds, is passed to the miner as `--warmup`, and the script reads the `Measured:` line the miner prints when it stops. That line is the average over everything after the warmup, so kernel compilation and the first slow round are genuinely left out rather than merely diluted.
 - **Alternates the order each pass.** Being second is a real penalty, so it must not always land on the same contender. If your means still depend on order, drift is dominating and the numbers are not yet meaningful.
 - **Repeats.** `-p`, default two passes, and it prints the min and max alongside the mean so you can see the spread rather than trusting a single figure.
+- **Says when that spread is too wide to mean anything.** If a contender's passes differ by more than 3% of its mean it prints a warning naming the contender and the percentage, because a mean over runs that disagree by 20% is otherwise reported in exactly the shape of a result.
 - **Warns if** `self-test` **fails** on the first backend, because a fast wrong kernel is the failure this project is arranged to prevent.
-- **Records provenance** with `-o`: date, host, mode, backend and kernel, since an unlabelled hashrate is not reproducible across driver releases.
+- **Records provenance** with `-o`: date, host, mode, backend, kernel, the min and max, and the flags that produced the row. Neither an unlabelled hashrate nor one whose procedure went unrecorded is reproducible.
+
+## The cooldown is not the whole problem
+
+Both of those defaults were raised after measuring what the previous ones did, and `-x` exists because cooling down between runs turned out not to be sufficient on its own.
+
+Holding everything else fixed and putting a 30-second cooldown against 60 on create3, three local work sizes as the contenders, three passes each with every contender rotated through every position:
+
+| cooldown | mean over nine runs | widest spread within one contender |
+| --- | --- | --- |
+| 30s | 358.06 MH/s | 15.7 MH/s |
+| 60s | 363.12 MH/s | 7.2 MH/s |
+
+Thirty seconds costs 1.4% and roughly triples the spread, which is enough to invent a winner: in the 30-second set the contender that happened to draw the first and coldest slot came out 1% ahead, and at 60 seconds all three finished within 0.1% of one another. Local work size makes no measurable difference here at all — a conclusion only the longer cooldown was able to reach.
+
+A cooldown also cannot undo the state the machine was already in when the benchmark started. Run at the old defaults directly after a heavy GPU session, four passes of a single unchanged configuration gave:
+
+```
+pass 1  opencl:tuned     284.543 MH/s
+pass 2  opencl:tuned     317.898 MH/s
+pass 3  opencl:tuned     346.768 MH/s
+pass 4  opencl:tuned     341.876 MH/s
+```
+
+A 22% spread, a reported mean of 322.771 sitting 11% below the settled figure, and — the part that breaks the harness's own reasoning — a drift that climbs rather than falls, because the machine was recovering rather than heating. Alternating order cancels a drift that runs one way for the whole run; against this it does nothing. Discarded passes do: they absorb the recovery, and printing their figures is what tells you whether the cooldown was long enough, because a discarded pass far below the measured ones means it was not.
 
 ## Two numbers, and which one to quote
 
@@ -75,11 +101,33 @@ scripts/bench.sh -k "tuned plain" -p 3
 
 Check agreement before you believe a speedup: `cargo test --test derivation` and `1miner self-test --kernel <name>`. A kernel that is fast and wrong is worse than no kernel.
 
+## What turned out not to matter
+
+Two tuning flags repay far less attention than their presence suggests, at least on an M4 Max against the OpenCL backend. Both are cheap to sweep, and worth sweeping before optimising anything that sits behind them.
+
+`--work` makes no measurable difference. On create3, `0`, `32` and `128` land within 0.1% of one another once the cooldown is long enough for that to be visible. On profanity, `32`, `64` and `128` tie, with `0` and `256` about 3% behind.
+
+Lowering `--inverse-size` only ever loses. Holding the round size fixed at its default 4177920 points and moving the split between `-i` and `-I`:
+
+| `-i` × `-I` | private memory per work item | mean | against the default |
+| --- | --- | --- | --- |
+| 255 × 16384 | 16320 B | 354.3 MH/s | — |
+| 128 × 32640 | 8192 B | 350.5 MH/s | −1.1% |
+| 64 × 65280 | 4096 B | 340.0 MH/s | −4.1% |
+| 32 × 130560 | 2048 B | 306.7 MH/s | −13.4% |
+| 16 × 261120 | 1024 B | 246.2 MH/s | −30.5% |
+
+The extra modular inversions outweigh whatever the smaller private arrays win back, so `-i` is an escape valve for memory pressure rather than a speed knob. That also bounds how much those arrays cost in the first place: halving them moved the figure by one percent, in the direction the extra inversions alone predict. On a GPU where private memory means scratch rather than a slice of unified memory the picture may differ, which is the reason to re-run the sweep there rather than carry this conclusion over.
+
+These figures were taken at a short cooldown, so trust the ranking rather than the rates: it is monotone, it survived reversing the order, and the default won from the hottest slot.
+
 ## Recording results
 
 Note the GPU, the driver or OS version, the backend, the kernel variant, the mode and the date. Hashrates move with driver releases, so an unlabelled number is not reproducible.
 
-Measured on an Apple M4 Max (40-core GPU), macOS 26.5, `scripts/bench.sh` with an 8-second warmup and a 20-second measured window, two passes in alternating order, August 2026. Each figure is the mean, with the spread in brackets:
+Measured on an Apple M4 Max (40-core GPU), macOS 26.5, `scripts/bench.sh` with an 8-second warmup and a 20-second measured window, two passes in alternating order, August 2026. Each figure is the mean, with the spread in brackets.
+
+These were taken before the 60-second cooldown and the discarded pass, so treat them as a set that is internally consistent but around one to two percent low, with spreads narrower than that procedure can actually support; the whole table is due a re-measurement under the current defaults. The one row re-measured since is create3 on OpenCL, which came out at 363.3 MH/s (358.8–366.1) over three rotated passes at a 60-second cooldown, against the 356.1 below:
 
 | Mode      | Backend     | Kernel   | Speed                                        |
 | --------- | ----------- | -------- | -------------------------------------------- |
