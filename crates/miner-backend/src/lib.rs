@@ -206,6 +206,24 @@ pub enum Progress {
     },
 }
 
+impl Progress {
+    /// Hand one finding to the reporter.
+    ///
+    /// Both queued and immediate reporting go through here so that a backend
+    /// which starts dropping matches cannot be the one that forgets to say so:
+    /// adding a variant to `Progress` without a callback for it stops being
+    /// something four separate `match` arms could each miss.
+    pub fn report(&self, reporter: &mut dyn Reporter) {
+        match self {
+            Progress::Hit(hit) => reporter.on_hit(hit),
+            Progress::Dropped {
+                count,
+                device_index,
+            } => reporter.on_dropped(*count, *device_index),
+        }
+    }
+}
+
 /// Progress callbacks, invoked from the run loop.
 pub trait Reporter: Send {
     fn on_hit(&mut self, hit: &Hit);

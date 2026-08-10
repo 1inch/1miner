@@ -186,13 +186,7 @@ fn run_profanity(
 fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
     let guard = hits.lock().unwrap();
     for found in guard.iter().skip(from) {
-        match found {
-            Progress::Hit(hit) => reporter.on_hit(hit),
-            Progress::Dropped {
-                count,
-                device_index,
-            } => reporter.on_dropped(*count, *device_index),
-        }
+        found.report(reporter);
     }
     guard.len()
 }

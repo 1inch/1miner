@@ -409,13 +409,7 @@ impl Rounds<'_> {
         };
 
         for progress in found {
-            match progress {
-                Progress::Hit(hit) => reporter.on_hit(&hit),
-                Progress::Dropped {
-                    count,
-                    device_index,
-                } => reporter.on_dropped(count, device_index),
-            }
+            progress.report(reporter);
         }
     }
 }
