@@ -1,35 +1,26 @@
-//! Metal backend for the salt modes on macOS.
+//! create2, create3 and 1nft on Metal.
 //!
-//! Apple deprecated OpenCL, and on Apple silicon it is both slower and capped
-//! at OpenCL 1.2, so Metal is the fast local path. Only the keccak-based salt
-//! modes are supported; profanity needs a secp256k1 kernel that does not exist
-//! for Metal yet, and OpenCL remains the backend that covers every mode.
-//!
-//! There is one system default device, so this runs single threaded.
+//! Unlike the OpenCL path, the 200-byte pre-image arrives in a buffer rather
+//! than as a compile-time constant, so changing deployer, code hash or base
+//! salt does not force a pipeline rebuild.
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
 use std::time::Instant;
 
-use miner_core::{MineMode, ModeConfig, SaltConfig, ScoreSpec};
-use objc2::rc::Retained;
+use miner_core::{MineMode, SaltConfig, ScoreSpec};
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLDevice, MTLResourceOptions, MTLSize,
 };
 
+use super::{MetalBackend, set_bytes, set_slice, threadgroup_width};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
 use crate::{
-    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Hit, Job, MAX_SCORE, Progress, RESULT_SLOTS,
-    Reporter, Result,
+    BackendError, EXACT_CAPACITY, Hit, Job, MAX_SCORE, Progress, RESULT_SLOTS, Reporter, Result,
+    kernels,
 };
 
 const SLOTS: usize = RESULT_SLOTS;
-
-pub const SALT_SOURCE: &str = include_str!("../../../kernels/metal/salt.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -59,7 +50,7 @@ struct MtResult {
     found: u32,
 }
 
-/// One `--exact` mask, matching `Pattern` in kernels/metal/salt.metal.
+/// One `--exact` mask, matching `Pattern` in kernels/metal/scoring.metal.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MtPattern {
@@ -76,48 +67,8 @@ impl From<&ScoreSpec> for MtPattern {
     }
 }
 
-pub struct MetalBackend {
-    infos: Vec<DeviceInfo>,
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-}
-
 impl MetalBackend {
-    pub fn new() -> Result<Self> {
-        let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::NoDevices("metal"))?;
-        let infos = vec![DeviceInfo {
-            index: 0,
-            name: device.name().to_string(),
-            compute_units: 0,
-            global_memory: device.recommendedMaxWorkingSetSize(),
-        }];
-        Ok(Self { infos, device })
-    }
-}
-
-impl Backend for MetalBackend {
-    fn name(&self) -> &'static str {
-        "metal"
-    }
-
-    fn devices(&self) -> &[DeviceInfo] {
-        &self.infos
-    }
-
-    fn run(
-        &mut self,
-        job: &Job,
-        reporter: &mut dyn Reporter,
-        should_stop: &(dyn Fn() -> bool + Sync),
-    ) -> Result<()> {
-        let ModeConfig::Salt(cfg) = &job.mode else {
-            return Err(BackendError::Unsupported("metal", "profanity"));
-        };
-        self.run_salt(cfg, job, reporter, should_stop)
-    }
-}
-
-impl MetalBackend {
-    fn run_salt(
+    pub(super) fn run_salt(
         &self,
         cfg: &SaltConfig,
         job: &Job,
@@ -129,10 +80,7 @@ impl MetalBackend {
             .newCommandQueue()
             .ok_or_else(|| BackendError::Other("failed to create a Metal command queue".into()))?;
 
-        let source = NSString::from_str(SALT_SOURCE);
-        let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .map_err(|e| BackendError::Build(format!("Metal kernel failed to compile: {e:?}")))?;
+        let library = self.build_library(kernels::METAL_SALT)?;
         // --exact asks a different question and so runs a different kernel over
         // a different result layout; see the comment on `salt_iterate_exact`.
         let kernel_name = if job.is_exact() {
@@ -140,12 +88,7 @@ impl MetalBackend {
         } else {
             "salt_iterate"
         };
-        let function = library
-            .newFunctionWithName(&NSString::from_str(kernel_name))
-            .ok_or_else(|| BackendError::Build(format!("{kernel_name} not found in library")))?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| BackendError::Build(format!("pipeline creation failed: {e:?}")))?;
+        let pipeline = self.pipeline(&library, kernel_name)?;
 
         let results = device
             .newBufferWithLength_options(
@@ -170,14 +113,7 @@ impl MetalBackend {
             .map(MtPattern::from)
             .collect();
 
-        let threadgroup = pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(if job.tuning.work_size > 0 {
-                job.tuning.work_size
-            } else {
-                256
-            })
-            .max(1);
+        let threadgroup = threadgroup_width(&pipeline, job.tuning.work_size);
 
         let start = Instant::now();
         let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
@@ -293,44 +229,6 @@ impl MetalBackend {
     }
 }
 
-/// Push a small struct straight into the command encoder rather than
-/// allocating a buffer for it.
-///
-/// # Safety
-///
-/// `T` must have the layout the kernel expects at `index`, which means a
-/// `#[repr(C)]` type matching the corresponding parameter in
-/// kernels/metal/salt.metal.
-unsafe fn set_bytes<T>(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    value: &T,
-    index: usize,
-) {
-    let ptr =
-        NonNull::new(std::ptr::from_ref(value) as *mut c_void).expect("reference is never null");
-    // SAFETY: `ptr` points at `value`, which outlives the call, and the length
-    // is exactly its size. Metal copies the bytes into the command buffer, so
-    // the borrow does not have to outlive the encoding.
-    unsafe { encoder.setBytes_length_atIndex(ptr, size_of::<T>(), index) };
-}
-
-/// As `set_bytes`, for an array the kernel indexes.
-///
-/// # Safety
-///
-/// `T` must have the layout the kernel expects at `index`, and the slice must
-/// hold at least as many elements as the kernel will read.
-unsafe fn set_slice<T>(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    values: &[T],
-    index: usize,
-) {
-    let ptr = NonNull::new(values.as_ptr() as *mut c_void).expect("slice pointer is never null");
-    // SAFETY: as `set_bytes`, with the length covering the whole slice, which
-    // outlives the call because Metal copies it into the command buffer.
-    unsafe { encoder.setBytes_length_atIndex(ptr, size_of_val(values), index) };
-}
-
 /// Build the hit a filled result slot describes, re-deriving the address from
 /// the salt so a kernel that reconstructed the wrong one is caught.
 fn hit_from(
@@ -416,11 +314,6 @@ fn read_exact(
     found
 }
 
-/// Metal supports the salt modes only.
-pub fn supports(mode: MineMode) -> bool {
-    mode.is_salt_mode()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,41 +325,5 @@ mod tests {
         assert_eq!(size_of::<MtPattern>(), 40);
         // 25 lanes plus six 32-bit fields.
         assert_eq!(size_of::<MtParams>(), 200 + 24);
-    }
-
-    #[test]
-    fn only_salt_modes_are_supported() {
-        assert!(supports(MineMode::Create2));
-        assert!(supports(MineMode::Create3));
-        assert!(supports(MineMode::Nft));
-        assert!(!supports(MineMode::Profanity));
-    }
-
-    #[test]
-    fn kernel_source_declares_the_entry_point() {
-        assert!(SALT_SOURCE.contains("kernel void salt_iterate"));
-    }
-
-    /// The scoring constants are duplicated in the Metal source, so keep them
-    /// pinned to the shared enum.
-    #[test]
-    fn scoring_constants_agree_with_the_enum() {
-        use miner_core::ScoreFn;
-        for (name, value) in [
-            ("kBenchmark", ScoreFn::Benchmark as u32),
-            ("kZeroBytes", ScoreFn::ZeroBytes as u32),
-            ("kMatching", ScoreFn::Matching as u32),
-            ("kLeading", ScoreFn::Leading as u32),
-            ("kRange", ScoreFn::Range as u32),
-            ("kMirror", ScoreFn::Mirror as u32),
-            ("kDoubles", ScoreFn::Doubles as u32),
-            ("kLeadingRange", ScoreFn::LeadingRange as u32),
-        ] {
-            let expected = format!("constant uint {name} = {value};");
-            assert!(
-                SALT_SOURCE.contains(&expected),
-                "missing or wrong: {expected}"
-            );
-        }
     }
 }

@@ -167,19 +167,10 @@ fn open_backend(
         "metal" => {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             {
-                if !miner_backend::metal::supports(mode.mode()) {
-                    anyhow::bail!(
-                        "the metal backend covers create2, create3 and 1nft; profanity needs \
-                         a secp256k1 kernel that does not exist for Metal yet, so use \
-                         --backend opencl for it"
-                    );
-                }
                 Ok(Box::new(miner_backend::metal::MetalBackend::new()?))
             }
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
             {
-                // Only the arm above reads it, and that arm is compiled out here.
-                let _ = mode;
                 anyhow::bail!(
                     "metal is only available on macOS builds compiled with --features metal"
                 )

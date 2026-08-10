@@ -11,7 +11,7 @@ One GPU miner for four kinds of Ethereum vanity address, with swappable compute 
 | `1nft`      | 1inch Address NFT magics                       | a `bytes16` magic for `mint()` / `mintFor()` |
 
 
-Backends are chosen at run time: **OpenCL** by default and the only one that covers every mode, **Metal** on macOS, and a portable **CPU** fallback. CUDA is the intended next addition.
+Backends are chosen at run time: **OpenCL** by default, **Metal** on macOS, and a portable **CPU** fallback. All three cover every mode; only OpenCL spreads a search across several GPUs. CUDA is the intended next addition.
 
 ## Quick start
 
@@ -58,13 +58,14 @@ Measured on an Apple M4 Max (40-core GPU) with `scripts/bench.sh`: 20-second win
 | -------------- | ---------------------- | ---------- |
 | create2        | Metal                  | 724.4 MH/s |
 | create2        | OpenCL                 | 721.8 MH/s |
+| profanity      | Metal                  | ~396 MH/s  |
 | profanity      | OpenCL                 | 381.6 MH/s |
 | create3 / 1nft | OpenCL                 | 356.1 MH/s |
 | create3 / 1nft | Metal                  | 352.2 MH/s |
 | create3 / 1nft | CPU (NEON, 16 threads) | 87.3 MH/s  |
 
 
-CREATE3 runs at about half of CREATE2 because it hashes twice: CREATE2 for the proxy, then CREATE for the contract. Rates are not comparable across modes for that reason. See [docs/benchmarking.md](docs/benchmarking.md).
+CREATE3 runs at about half of CREATE2 because it hashes twice: CREATE2 for the proxy, then CREATE for the contract. Rates are not comparable across modes for that reason. The profanity Metal figure is approximate because the two GPU backends sit closer together than a single pass varies; [docs/benchmarking.md](docs/benchmarking.md) shows the passes behind it and why every figure here is worth re-measuring on your own hardware.
 
 ## Docker
 

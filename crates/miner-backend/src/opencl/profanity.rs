@@ -1,15 +1,9 @@
 //! secp256k1 vanity search on OpenCL.
 //!
-//! Ported from profanity2's dispatcher. Each work item starts at
-//! `seed_pub + (seed + (id << 192)) * G` and every round advances all points by
-//! one generator step, so the scalar for a hit is `seed + round + (id << 192)`.
-//! That offset is what gets reported: added to the user's seed private key it
-//! yields the private key for the found address, and the miner never sees a
-//! private key at any point.
-//!
-//! Devices are partitioned inside that offset rather than left to chance: the
-//! top lane of `seed` carries a device slot above the bits the kernel adds `id`
-//! into, so two devices cannot walk the same sequence however they are drawn.
+//! Ported from profanity2's dispatcher. The offset arithmetic that makes a hit
+//! usable, and the result-slot layout it is read out of, live in
+//! [`crate::profanity`] and are shared with the Metal backend; what is here is
+//! how OpenCL enumerates candidates.
 //!
 //! Three large scratch buffers hold the batched-inversion state, sized
 //! `inverse_size * inverse_multiple` elements of 32 bytes each.
@@ -18,48 +12,24 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use miner_core::{ModeConfig, ProfanityConfig, ScoreFn, ScoreSpec, secp256k1::generator_table};
+use miner_core::{ModeConfig, ProfanityConfig, ScoreFn};
 use opencl3::command_queue::CommandQueue;
 use opencl3::context::Context;
 use opencl3::device::Device;
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
-use rand::RngCore;
 
 use super::{DeviceId, build_program, cl_err, enumerate_devices};
+use crate::profanity::{
+    MpNumber, MpPoint, ResultSlot, RoundContext, be_bytes_to_ulong4, check_offset_fields,
+    device_seed, precomp_table,
+};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
-    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Hit, Job, KeccakVariant, MAX_SCORE,
-    Progress, RESULT_SLOTS, Reporter, Result, kernels,
+    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
+    RESULT_SLOTS, Reporter, Result, kernels,
 };
-
-/// `mp_number` from profanity2's types.hpp: eight 32-bit words, 16-byte aligned.
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Default)]
-struct MpNumber {
-    d: [cl_uint; 8],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct ClPoint {
-    x: MpNumber,
-    y: MpNumber,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct ClResult {
-    found: cl_uint,
-    found_id: cl_uint,
-    found_hash: [cl_uchar; 20],
-}
-
-/// OpenCL `ulong4`: four 64-bit lanes, 32-byte aligned.
-#[repr(C, align(32))]
-#[derive(Clone, Copy, Default)]
-struct ClUlong4([u64; 4]);
 
 pub struct ProfanityBackend {
     ids: Vec<DeviceId>,
@@ -123,82 +93,6 @@ fn score_kernel_name(function: ScoreFn) -> &'static str {
     }
 }
 
-/// Big-endian 32 bytes into four 64-bit lanes, least significant lane first.
-fn be_bytes_to_ulong4(bytes: &[u8; 32]) -> ClUlong4 {
-    let mut lanes = [0u64; 4];
-    for (i, lane) in lanes.iter_mut().enumerate() {
-        let start = 24 - i * 8;
-        *lane = u64::from_be_bytes(bytes[start..start + 8].try_into().unwrap());
-    }
-    ClUlong4(lanes)
-}
-
-/// The most significant lane of an offset is a packed field. From the top: 16
-/// bits left clear so `seed_priv + offset` cannot overflow 256 bits, 16 bits of
-/// device slot, and 32 bits the kernel adds the work-item id into.
-const ID_BITS: u32 = 32;
-const MAX_ROUND_SIZE: u64 = 1 << ID_BITS;
-const MAX_DEVICES: u64 = 1 << 16;
-
-/// One device's starting offset: 192 random bits, so two runs do not cover the
-/// same ground, above a device slot no other device of this run can reach.
-///
-/// Cryptographic quality is not needed — the security of the result comes from
-/// the user's own seed key, which never enters this process — but `rand::rng()`
-/// is per-thread and OS-seeded, unlike a clock read, and it is what the salt
-/// modes already use.
-fn device_seed(device_index: usize) -> ClUlong4 {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    let mut lanes = be_bytes_to_ulong4(&bytes);
-    lanes.0[3] = (device_index as u64) << ID_BITS;
-    lanes
-}
-
-/// Both fields have to hold for the separation to mean anything: a round wider
-/// than its id field would reach into the next device's slot, and a slot above
-/// its own field into the bits that must stay clear. Neither limit is anywhere
-/// near a tuning that fits in memory — the default round is 2²² work items —
-/// but checking them is what makes the separation structural rather than
-/// assumed.
-fn check_offset_fields(round_size: usize, infos: &[DeviceInfo]) -> Result<()> {
-    if round_size as u64 > MAX_ROUND_SIZE {
-        return Err(BackendError::Other(format!(
-            "--inverse-size x --inverse-multiple is {round_size} work items, \
-             above the {MAX_ROUND_SIZE} one round can address"
-        )));
-    }
-    let highest = infos.iter().map(|i| i.index).max().unwrap_or(0) as u64;
-    if highest >= MAX_DEVICES {
-        return Err(BackendError::Other(format!(
-            "device index {highest} is above the {MAX_DEVICES} an offset can keep apart"
-        )));
-    }
-    Ok(())
-}
-
-/// `seed + round + (found_id << 192)` as a big-endian 32-byte scalar.
-///
-/// profanity2 open-codes this with a shortcut carry that misfires when a lane
-/// is already zero; a full 256-bit add is used here instead.
-fn offset_scalar(seed: &ClUlong4, round: u64, found_id: u32) -> [u8; 32] {
-    let mut lanes = seed.0;
-    let mut carry = round as u128;
-    for lane in lanes.iter_mut() {
-        let sum = *lane as u128 + (carry & 0xFFFF_FFFF_FFFF_FFFF);
-        *lane = sum as u64;
-        carry = (carry >> 64) + (sum >> 64);
-    }
-    lanes[3] = lanes[3].wrapping_add(found_id as u64);
-
-    let mut out = [0u8; 32];
-    for (i, lane) in lanes.iter().enumerate() {
-        let start = 24 - i * 8;
-        out[start..start + 8].copy_from_slice(&lane.to_be_bytes());
-    }
-    out
-}
-
 fn run_profanity(
     ids: &[DeviceId],
     infos: &[DeviceInfo],
@@ -217,17 +111,7 @@ fn run_profanity(
     );
 
     // Shared by every device and identical for all of them.
-    let table = generator_table();
-    let precomp: Vec<ClPoint> = table
-        .iter()
-        .map(|p| {
-            let (x, y) = p.to_bytes();
-            ClPoint {
-                x: to_mp(&x),
-                y: to_mp(&y),
-            }
-        })
-        .collect();
+    let precomp = precomp_table();
 
     let counters: Vec<AtomicU64> = ids.iter().map(|_| AtomicU64::new(0)).collect();
     let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
@@ -299,15 +183,6 @@ fn run_profanity(
     }
 }
 
-fn to_mp(be: &[u8; 32]) -> MpNumber {
-    let mut d = [0u32; 8];
-    for (i, word) in d.iter_mut().enumerate() {
-        let start = 28 - i * 4;
-        *word = u32::from_be_bytes(be[start..start + 4].try_into().unwrap());
-    }
-    MpNumber { d }
-}
-
 fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
     let guard = hits.lock().unwrap();
     for found in guard.iter().skip(from) {
@@ -330,7 +205,7 @@ fn run_device(
     job: &Job,
     source: &str,
     options: &str,
-    precomp: &[ClPoint],
+    precomp: &[MpPoint],
     counter: &AtomicU64,
     hits: &Mutex<Vec<Progress>>,
     best_score: &AtomicU64,
@@ -369,7 +244,7 @@ fn run_device(
     // CL_MEM_USE_HOST_PTR nor CL_MEM_COPY_HOST_PTR, so OpenCL owns the storage
     // and no host lifetime has to be upheld. This applies to all seven.
     let mut mem_precomp = unsafe {
-        Buffer::<ClPoint>::create(
+        Buffer::<MpPoint>::create(
             &context,
             CL_MEM_READ_ONLY,
             precomp.len(),
@@ -394,7 +269,7 @@ fn run_device(
     .map_err(cl_err("failed to allocate lambda buffer"))?;
     // SAFETY: as above.
     let mut mem_result = unsafe {
-        Buffer::<ClResult>::create(
+        Buffer::<ResultSlot>::create(
             &context,
             CL_MEM_READ_WRITE,
             RESULT_SLOTS,
@@ -423,7 +298,7 @@ fn run_device(
     }
     .map_err(cl_err("failed to allocate data2"))?;
 
-    let mut results = vec![ClResult::default(); RESULT_SLOTS];
+    let mut results = vec![ResultSlot::default(); RESULT_SLOTS];
     // SAFETY: all four writes are blocking, so each source only has to be live
     // for the duration of its call, and each holds exactly as many elements as
     // the buffer it fills was created with.
@@ -485,7 +360,7 @@ fn run_device(
     // The exact kernel appends from a counter in slot 0, so clearing it each
     // round is the protocol rather than a workaround: it is what lets the next
     // round start at slot 1 and what bounds the writes.
-    let zeros = vec![ClResult::default(); RESULT_SLOTS];
+    let zeros = vec![ResultSlot::default(); RESULT_SLOTS];
 
     loop {
         if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
@@ -564,12 +439,14 @@ fn run_device(
         let context = RoundContext {
             cfg,
             job,
-            info,
+            device_index: info.index,
             seed: &seed,
             round,
         };
         let found = if job.is_exact() {
-            context.drain_exact(&results)
+            // Slot 0 counts this round's matches, including any the buffer had
+            // no room for.
+            context.drain_exact(&results, results[0].found)
         } else {
             let threshold = best_score.load(Ordering::Relaxed);
             // Every device's progress, not just this one's, so a device that is
@@ -591,85 +468,6 @@ fn run_device(
 
     queue.finish().map_err(cl_err("finish failed"))?;
     Ok(())
-}
-
-/// What turning a result slot into a `Hit` needs beyond the slot itself.
-struct RoundContext<'a> {
-    cfg: &'a ProfanityConfig,
-    job: &'a Job,
-    info: &'a DeviceInfo,
-    seed: &'a ClUlong4,
-    round: u64,
-}
-
-impl RoundContext<'_> {
-    /// Build the hit a filled result slot describes.
-    ///
-    /// The offset is rebuilt from the seed, the round and the work-item id
-    /// rather than read off the kernel, so walking the seed public key forward
-    /// by it and comparing is what catches offset accounting that has gone
-    /// wrong — which would otherwise hand over a key controlling a different
-    /// address.
-    fn hit_from(&self, slot: &ClResult, score: u32, pattern: Option<usize>) -> Hit {
-        let mut address = [0u8; 20];
-        address.copy_from_slice(&slot.found_hash);
-        let offset = offset_scalar(self.seed, self.round, slot.found_id);
-
-        Hit {
-            score,
-            address,
-            salt: None,
-            magic: None,
-            offset: Some(offset),
-            pattern,
-            device_index: self.info.index,
-            verified: !self.job.verify || self.cfg.address_for_offset(&offset) == Some(address),
-        }
-    }
-
-    /// Result slots are indexed by score, so the best hit is the highest
-    /// occupied slot above what has already been reported.
-    fn take_best(&self, results: &[ClResult], threshold: u64) -> Option<(u32, Hit)> {
-        for score in (1..=MAX_SCORE).rev() {
-            if results[score].found == 0 {
-                continue;
-            }
-            if score as u64 <= threshold {
-                break;
-            }
-            return Some((
-                score as u32,
-                self.hit_from(&results[score], score as u32, None),
-            ));
-        }
-        None
-    }
-
-    /// Slots are the round's matches in arrival order, with slot 0 counting
-    /// them all — including any the buffer had no room for.
-    fn drain_exact(&self, results: &[ClResult]) -> Vec<Progress> {
-        let total = results[0].found;
-        let stored = (total as usize).min(EXACT_CAPACITY);
-        let masks = self.job.exact.as_deref().unwrap_or_default();
-
-        let mut found: Vec<Progress> = (1..=stored)
-            .map(|slot| {
-                // `found` names the mask that matched in this layout, one-based
-                // so an untouched slot is distinguishable from mask 0.
-                let pattern = results[slot].found.saturating_sub(1) as usize;
-                let score = masks.get(pattern).map_or(0, ScoreSpec::constrained_bytes);
-                Progress::Hit(self.hit_from(&results[slot], score, Some(pattern)))
-            })
-            .collect();
-
-        if let Some(dropped) = total.checked_sub(stored as u32).filter(|d| *d > 0) {
-            found.push(Progress::Dropped {
-                count: dropped,
-                device_index: self.info.index,
-            });
-        }
-        found
-    }
 }
 
 /// Split a launch into `work_max` sized pieces, as the reference dispatcher does.
@@ -709,105 +507,51 @@ fn enqueue_chunked(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
 
-    fn info(index: usize) -> DeviceInfo {
-        DeviceInfo {
-            index,
-            name: String::new(),
-            compute_units: 0,
-            global_memory: 0,
-        }
-    }
-
+    /// The exact kernel has no score and no bar, so it is picked by
+    /// `--exact` rather than by the scoring function, which is left at
+    /// whatever the mode parsed.
     #[test]
-    fn offset_is_seed_plus_round_plus_shifted_id() {
-        let seed = ClUlong4([5, 0, 0, 0]);
-        let offset = offset_scalar(&seed, 7, 0);
-        assert_eq!(u64::from_be_bytes(offset[24..].try_into().unwrap()), 12);
-
-        // found_id lands in the most significant lane, i.e. shifted by 192 bits.
-        let with_id = offset_scalar(&seed, 0, 3);
-        assert_eq!(u64::from_be_bytes(with_id[..8].try_into().unwrap()), 3);
-        assert_eq!(u64::from_be_bytes(with_id[24..].try_into().unwrap()), 5);
-    }
-
-    /// profanity2's shortcut carry treats an already-zero lane as a carry out.
-    /// A full add must not.
-    #[test]
-    fn carry_only_propagates_on_real_overflow() {
-        let seed = ClUlong4([u64::MAX, 0, 0, 0]);
-        let offset = offset_scalar(&seed, 1, 0);
-        assert_eq!(u64::from_be_bytes(offset[24..].try_into().unwrap()), 0);
-        assert_eq!(u64::from_be_bytes(offset[16..24].try_into().unwrap()), 1);
-
-        let no_carry = ClUlong4([1, 0, 0, 0]);
-        let offset = offset_scalar(&no_carry, 1, 0);
-        assert_eq!(u64::from_be_bytes(offset[16..24].try_into().unwrap()), 0);
-    }
-
-    #[test]
-    fn seed_clears_the_top_bits_so_a_sum_cannot_overflow() {
-        for device in [0, 1, 7, MAX_DEVICES as usize - 1] {
-            assert_eq!(device_seed(device).0[3] >> 48, 0);
-        }
-    }
-
-    #[test]
-    fn seed_reserves_the_top_lane_for_the_device_slot() {
-        for device in [0, 1, 7, MAX_DEVICES as usize - 1] {
-            assert_eq!(device_seed(device).0[3], (device as u64) << ID_BITS);
-        }
-    }
-
-    /// The whole point of the packing: the widest permitted round on one device
-    /// stops short of the next device's slot, so no work item of one device can
-    /// land on an offset another device reaches.
-    #[test]
-    fn the_widest_round_stops_short_of_the_next_device_slot() {
-        // The largest id a permitted round produces, as the kernel reports it.
-        let widest = u32::try_from(MAX_ROUND_SIZE - 1).expect("a round must fit the uint foundId");
-        // Identical low lanes, as if the RNG had failed both devices, and the
-        // highest round against the lowest: only the top lane can separate them.
-        let shared = |device: u64| ClUlong4([9, 9, 9, device << ID_BITS]);
-
-        for device in 0..4 {
-            let last = offset_scalar(&shared(device), u64::MAX >> 1, widest);
-            let first_of_next = offset_scalar(&shared(device + 1), 0, 0);
-            assert!(
-                last < first_of_next,
-                "device {device} reaches into the next slot"
+    fn exact_selects_its_own_kernel_whatever_the_scorer_says() {
+        for function in [ScoreFn::Benchmark, ScoreFn::Leading, ScoreFn::Mirror] {
+            assert_eq!(
+                score_kernel_name(function),
+                match function {
+                    ScoreFn::Benchmark => "profanity_iterate_score_benchmark",
+                    ScoreFn::Leading => "profanity_iterate_score_leading",
+                    _ => "profanity_iterate_score_mirror",
+                }
             );
         }
     }
 
-    /// The predecessor derived all 256 bits from a clock read, so two device
-    /// threads starting together usually drew the same seed.
+    /// Every name this picks has to exist in the source, and a typo here
+    /// fails at kernel creation on a device rather than in the suite.
     #[test]
-    fn the_random_part_of_a_seed_differs_every_draw() {
-        let drawn: HashSet<[u64; 4]> = (0..1000).map(|_| device_seed(0).0).collect();
-        assert_eq!(drawn.len(), 1000);
-    }
+    fn every_iterate_kernel_name_is_declared_in_the_source() {
+        let names = [
+            ScoreFn::Benchmark,
+            ScoreFn::ZeroBytes,
+            ScoreFn::Matching,
+            ScoreFn::Leading,
+            ScoreFn::Range,
+            ScoreFn::Mirror,
+            ScoreFn::Doubles,
+            ScoreFn::LeadingRange,
+        ]
+        .map(score_kernel_name);
 
-    #[test]
-    fn a_round_or_a_rig_too_large_for_the_offset_fields_is_rejected() {
-        assert!(check_offset_fields(MAX_ROUND_SIZE as usize, &[info(0)]).is_ok());
-        assert!(check_offset_fields(MAX_ROUND_SIZE as usize + 1, &[info(0)]).is_err());
-
-        let highest = MAX_DEVICES as usize - 1;
-        assert!(check_offset_fields(1, &[info(0), info(highest)]).is_ok());
-        assert!(check_offset_fields(1, &[info(0), info(highest + 1)]).is_err());
-    }
-
-    #[test]
-    fn public_key_lanes_are_least_significant_first() {
-        let mut be = [0u8; 32];
-        be[31] = 1;
-        assert_eq!(be_bytes_to_ulong4(&be).0, [1, 0, 0, 0]);
-        let mut be = [0u8; 32];
-        be[0] = 1;
-        assert_eq!(be_bytes_to_ulong4(&be).0, [0, 0, 0, 1 << 56]);
+        for name in names {
+            let macro_call = name.replace("profanity_iterate_score_", "");
+            assert!(
+                kernels::PROFANITY.contains(&format!("PROFANITY_SCORE_KERNEL({macro_call})")),
+                "profanity.cl does not instantiate {name}"
+            );
+        }
+        assert!(
+            kernels::PROFANITY.contains("__kernel void profanity_iterate_exact_match"),
+            "profanity.cl does not declare the exact kernel"
+        );
     }
 }

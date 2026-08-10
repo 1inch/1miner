@@ -26,7 +26,9 @@ sleep 30
   --benchmark --backend metal --seconds 30
 ```
 
-`profanity` needs OpenCL either way: it requires secp256k1 arithmetic on the GPU and only the OpenCL kernel provides it.
+Both backends cover all four modes, `profanity` included. Metal drives the one system default device, so a Mac with more than one GPU needs `--backend opencl` to use both.
+
+`profanity` holds three scratch buffers of 32 bytes per point, so the default `-i 255 -I 16384` asks for roughly 400 MB before anything else. That is comfortable on any Apple silicon Mac, but `-I` is the knob to turn down on a base-model machine that is already under memory pressure.
 
 ## Sandboxing
 

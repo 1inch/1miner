@@ -36,6 +36,9 @@ What it does, and what to reproduce if you measure by hand:
 - **Repeats.** `-p`, default two passes, and it prints the min and max alongside the mean so you can see the spread rather than trusting a single figure.
 - **Says when that spread is too wide to mean anything.** If a contender's passes differ by more than 3% of its mean it prints a warning naming the contender and the percentage, because a mean over runs that disagree by 20% is otherwise reported in exactly the shape of a result.
 - **Warns if** `self-test` **fails** on the first backend, because a fast wrong kernel is the failure this project is arranged to prevent.
+- **Names the binary it is about to time**, and warns when anything under `crates/` or `kernels/` is newer than it. The candidate list prefers `./target/release/1miner`, which is the previous build until you rebuild, and benchmarking a change you have not compiled reports the change as free. `MINER=/path/to/1miner` overrides the choice.
+- **Says why a run produced no rate** instead of only that it did. A backend that refuses the mode, a flag a older binary does not know, a device already busy: all of them used to arrive as the single word FAILED, with the explanation dropped by the same pipe that reads the rate.
+- **Collapses kernel variants for backends that have one.** `-k` selects an OpenCL keccak source; Metal and CPU ignore it, so they appear once, as `metal:builtin` rather than as two identical contenders.
 - **Records provenance** with `-o`: date, host, mode, backend, kernel, the min and max, and the flags that produced the row. Neither an unlabelled hashrate nor one whose procedure went unrecorded is reproducible.
 
 ## The cooldown is not the whole problem
@@ -119,6 +122,10 @@ Lowering `--inverse-size` only ever loses. Holding the round size fixed at its d
 
 The extra modular inversions outweigh whatever the smaller private arrays win back, so `-i` is an escape valve for memory pressure rather than a speed knob. That also bounds how much those arrays cost in the first place: halving them moved the figure by one percent, in the direction the extra inversions alone predict. On a GPU where private memory means scratch rather than a slice of unified memory the picture may differ, which is the reason to re-run the sweep there rather than carry this conclusion over.
 
+The private-memory column is an OpenCL fact. The Metal kernel keeps the same prefix products in the buffer it writes anyway, so `-i` there buys only the inversion trade and the middle column does not apply.
+
+`-I` does matter on Metal, and for a reason that has nothing to do with the arithmetic. Each round costs a fixed amount on top of its candidates, so smaller rounds pay it more often: 154 MH/s at `-I 1024`, 335 at 4096, about 397 at the default 16384. Part of that was the host holding the GPU idle while it read the round, which is why the profanity loop now keeps one round in flight; see below. The rest is dispatch overhead on the device and does not go away.
+
 These figures were taken at a short cooldown, so trust the ranking rather than the rates: it is monotone, it survived reversing the order, and the default won from the hottest slot.
 
 ## Recording results
@@ -141,6 +148,30 @@ These were taken before the 60-second cooldown and the discarded pass, so treat 
 | create3   | CPU, scalar | built-in | 36.2 MH/s (36.1–36.2, `MINER_NO_NEON=1`)     |
 
 For comparison, the C++ references on the same machine: ERADICATE2 at about 733 MH/s for create2, ERADICATE3 at 357 MH/s for create3, profanity2 at 353 MH/s. Those use a rolling window, so they were already honest figures.
+
+### profanity on Metal
+
+A discarded pass then two measured passes in rotating order, 40-second cooldowns, 8-second warmup, 20-second measured window, August 2026:
+
+| Backend | discarded | pass 1 | pass 2 |
+| --- | --- | --- | --- |
+| Metal | 387.8 | 321.5 | 407.6 |
+| OpenCL | 362.5 | 325.0 | 356.1 |
+
+Pass 1 is low for both, which is the useful part of the result: whatever slowed it was not a property of either backend, and reporting the mean of the three would have buried that in a single number. Excluding it, Metal runs about 397 MH/s against OpenCL's 359 on this machine.
+
+That still puts the two closer than the spread of a single pass, so treat the ordering as suggestive rather than settled. An earlier attempt at the same comparison produced Metal figures ranging from 240 to 401 MH/s, all of the low ones from runs launched immediately after an OpenCL process — which is the failure mode alternating and discarding a pass exists to expose, and the reason a single ordering is worth nothing here.
+
+### Measuring a change rather than a backend
+
+The same noise that makes 397-against-359 shaky makes a 2% change invisible, so measure a change where its effect is largest rather than where users will meet it. Pipelining the Metal round loop moves a fixed per-round cost, so shrinking the round amplifies it:
+
+| `-I` | one round at a time | one round in flight | change |
+| --- | --- | --- | --- |
+| 1024 | 135.6, 136.5 | 154.4, 154.5 | +13.5% |
+| 4096 | 312.9 | 334.6 | +6.9% |
+
+Both repeats land within 1% of each other, against a default-tuning comparison of the same two binaries that could not separate them at all. Converted to time per round the two rows agree on what was actually saved — 0.235 ms and 0.217 ms — which is the check that the model behind the experiment was right, and it prices the change at about 2% for a default run.
 
 Three things the table says:
 

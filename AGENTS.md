@@ -9,13 +9,15 @@ crates/miner-core/     address maths, scoring, mode config. CPU only, no I/O. Th
 crates/miner-backend/  the Backend trait, its OpenCL/Metal/CPU impls, NEON keccak, speed metering.
 crates/miner-cli/      clap surface, terminal output, self-test.
 kernels/opencl/        keccak_tuned.cl, keccak_plain.cl, salt.cl, profanity.cl
-kernels/metal/         salt.metal
+kernels/metal/         keccak.metal, scoring.metal, salt.metal, profanity.metal
 docs/                  user and contributor documentation.
 scripts/               bench.sh benchmark harness; profanity-keygen.sh and profanity-final-key.sh, the seed keypair and the offset-to-key step.
 references/            upstream C++ miners (profanity2, ERADICATE2/3). Gitignored, read-only.
 ```
 
 The three salt modes share one kernel: `create3`/`1nft` add a second keccak, and `1nft` pins the low 16 salt bytes host-side. Kernel sources are embedded with `include_str!` in `crates/miner-backend/src/kernels.rs`, so the binary is self-contained — never add a runtime file lookup for a kernel.
+
+A Metal library is one translation unit built from concatenated sources, so `keccak.metal` and `scoring.metal` are a prelude both Metal kernels are compiled with, and `keccak.metal` carries the only `#include` and stays first. Host-side, `crates/miner-backend/src/profanity.rs` owns the offset arithmetic and result-slot layout for both GPU backends; the field arithmetic stays written twice on purpose, since that is what the agreement tests compare.
 
 ## Commands
 

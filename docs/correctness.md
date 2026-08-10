@@ -24,7 +24,7 @@ Runs the checks against whatever device is actually present:
 1miner self-test --backend cpu
 ```
 
-All four modes are covered. The three salt modes get the planted target described below. profanity gets a short real search instead, in both plain and `--contract` shape, because a profanity work item's address cannot be predicted before the run the way a salt one can — so what is asserted is the property that protects a real run: every offset reported has to name the address reported with it. Metal prints those two as `skip`, having no secp256k1 kernel to test.
+All four modes are covered, on every backend. The three salt modes get the planted target described below. profanity gets a short real search instead, in both plain and `--contract` shape, because a profanity work item's address cannot be predicted before the run the way a salt one can — so what is asserted is the property that protects a real run: every offset reported has to name the address reported with it.
 
 Worth running on a freshly rented box before committing it to a long job. It takes a second or two and catches a bad driver or a miscompiled kernel before the rental clock has cost you anything.
 
@@ -46,7 +46,9 @@ Worth running on a freshly rented box before committing it to a long job. It tak
 
 **Several masks in one pass.** Three disjoint masks, with every hit required to satisfy the one it was reported against and all three required to have matched something. The second half is what catches a kernel that tests only the first mask.
 
-**The secp256k1 kernel.** No target can be planted for profanity, so it is checked the way `self-test` checks it: a short search on a small round, with every offset the kernel reports required to name the address reported with it, in both plain and `--contract` shape. Then one of those offsets is handed to the CPU walk as its starting point. The kernel's field arithmetic is OpenCL C and the host's is Rust, so that last step is two implementations agreeing on one scalar rather than one checked against itself — the claim the salt modes get from their planted targets.
+**The secp256k1 kernel.** No target can be planted for profanity, so it is checked the way `self-test` checks it: a short search on a small round, with every offset the kernel reports required to name the address reported with it, in both plain and `--contract` shape. Then one of those offsets is handed to the CPU walk as its starting point. The kernel's field arithmetic is OpenCL C or Metal Shading Language and the host's is Rust, so that last step is two implementations agreeing on one scalar rather than one checked against itself — the claim the salt modes get from their planted targets. Run against both GPU backends.
+
+That check is the whole safety net for one class of bug, because the two backends count rounds differently and nothing else would notice. OpenCL reads each round's results at the top of the next iteration, so its round counter lags its dispatches by one; Metal reads them immediately and has to add the one back. Get it wrong and every hit is still a real address with a well-formed offset — the offset simply names the key to a different address, which the operator discovers when the wallet opens on an empty account.
 
 **Keccak variant equivalence.** Both permutations must find the same address for the same work item.
 

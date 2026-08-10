@@ -268,7 +268,7 @@ Import the key into the wallet you intend to use and confirm it shows the addres
 - Every run starts at a random offset, on `--backend cpu` as much as on a GPU, so searching the same public key again covers new ground instead of repeating itself.
 - Each GPU gets its own slice of the offset space rather than a random start of its own, so no two devices in a run can cover the same ground.
 - `1miner self-test` mines this mode briefly on your own device and re-derives every hit, with and without `--contract`. It is the same check `--verify` makes during a run, asked before you commit to one rather than hours in.
-- Metal does not support this mode: it needs a secp256k1 kernel, and only the keccak-based salt modes have one. Use `--backend opencl`.
+- Both GPU backends support this mode. On macOS `--backend metal` is usually the faster one; `--backend opencl` is the only one that spreads a search across several GPUs.
 - `--backend cpu` works and is useful for checking, but it performs a modular inversion per step and is orders of magnitude slower.
 - The kernel deliberately skips the equal-x edge cases in point addition, as the reference implementation does. They are astronomically rare and cost only a missed candidate.
 - `--no-verify` turns off the CPU re-derivation of each hit. Nothing here is fast enough to make that worthwhile.

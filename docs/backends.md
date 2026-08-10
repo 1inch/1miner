@@ -6,13 +6,15 @@ A backend decides *where* candidates are enumerated. A kernel decides *how*. Bot
 
 | `--backend` | Modes | Notes |
 | --- | --- | --- |
-| `opencl` (default) | all four | The only backend that supports `profanity`. Multi-GPU. |
-| `metal` | create2, create3, 1nft | macOS only, requires `--features metal` at build time. |
+| `opencl` (default) | all four | Multi-GPU. |
+| `metal` | all four | macOS only, requires `--features metal` at build time. Single device. |
 | `cpu` | all four | Portable fallback and the reference the others are checked against. Two-lane NEON on aarch64. |
 
-`profanity` is OpenCL-only because it needs secp256k1 field arithmetic on the GPU, and only the OpenCL kernel has it. The Metal path covers the keccak-based salt modes. CUDA is the intended next backend and slots in the same way.
+CUDA is the intended next backend and slots in the same way.
 
 Metal exists because Apple deprecated OpenCL: on Apple silicon it is capped at OpenCL 1.2 and is not the fast path the driver is tuned for. On an M4 Max the two are close, with Metal slightly ahead for create3.
+
+The two GPU backends differ in more than their API. OpenCL specialises its kernels at build time with `-D` and caches the compiled binary on disk; Metal compiles from source on every run and takes everything a job varies — the pre-image, the seed, the batch width — in a buffer instead, so changing any of them costs nothing. `--kernel` therefore does nothing on Metal, which has one Keccak. Metal also drives one system default device and so has no `--skip`, where OpenCL runs a thread per GPU.
 
 ## The CPU backend
 
@@ -37,12 +39,27 @@ They are functionally identical, which the test suite asserts by having both fin
 
 ## Adding a kernel variant
 
-1. Put the source in `kernels/opencl/` (or `kernels/metal/`).
+1. Put the source in `kernels/opencl/`.
 2. Add a `const` for it in `crates/miner-backend/src/kernels.rs`, which embeds sources with `include_str!` so the binary stays self-contained.
 3. Add a variant to `KeccakVariant` in `crates/miner-backend/src/lib.rs`, wiring up `source()`, `as_str()`, `parse()` and `all()`.
 4. Add the name to the `--kernel` value list in `crates/miner-cli/src/cli.rs`.
 
 The interface a Keccak source must provide is small: the `ethhash` union and `void sha3_keccakf(ethhash *)`. Note that `sha3_keccakf` is expected to apply the trailing `0x80` pad byte itself; see [how-address-derivation-works.md](how-address-derivation-works.md).
+
+## How the Metal sources fit together
+
+A Metal library is compiled from a single source string, so `kernels/metal/` is split by what is shared rather than by what is selectable, and the host concatenates the pieces in order:
+
+| File | Holds |
+| --- | --- |
+| `keccak.metal` | The permutation, the byte accessors, and the one `#include`. Always first. |
+| `scoring.metal` | The `Mode` and `Pattern` structs and `score_address`, shared by both kernels. |
+| `salt.metal` | create2 / create3 / 1nft. |
+| `profanity.metal` | secp256k1, a port of `kernels/opencl/profanity.cl`. |
+
+OpenCL carries a copy of the scoring functions in each of its two programs because it compiles them separately. Metal does not have to, and a shared copy is one that cannot drift.
+
+The pieces are ordinary text, so the ordering is a real constraint rather than a convention: a second `#include` in a later part fails the build with a line number in a file nobody wrote. `crates/miner-backend/src/metal/mod.rs` asserts both the order and the single include.
 
 Then check it and time it:
 
@@ -59,7 +76,7 @@ A new kernel that is fast and wrong is the failure this project is arranged to p
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
 | `-w`, `--work` | all GPU backends | Local work size / threadgroup width. `0` lets the driver choose. |
-| `-W`, `--work-max` | OpenCL | Largest single enqueue; rounds are split into chunks of this size. |
+| `-W`, `--work-max` | OpenCL, Metal profanity | Largest single enqueue; rounds are split into chunks of this size. |
 | `-S`, `--size` | salt modes | Candidates per round per device. Default 16777216. |
 | `-i`, `--inverse-size` | profanity | Batched-inversion width. Default 255, maximum 1024. |
 | `-I`, `--inverse-multiple` | profanity | Parallel inverse batches. Default 16384. |
@@ -69,7 +86,7 @@ A new kernel that is fast and wrong is the failure this project is arranged to p
 
 For profanity, `--inverse-size` times `--inverse-multiple` is both the number of points per round and the driver of memory use: three scratch buffers of 32 bytes per point, so the default 4.2M points needs roughly 400 MB. Lower `-I` first if a device runs out of memory or takes too long to initialise.
 
-`--inverse-size` is capped at 1024 because it becomes the length of two private `mp_number` arrays in the kernel, 32 bytes each: 1024 already asks a single work item for 64 KB of private memory, and past that a build spills or fails with no diagnostic worth reading. None of these flags accepts `0` except `--work`, where it means "let the driver choose".
+`--inverse-size` is capped at 1024 because in the OpenCL kernel it becomes the length of two private `mp_number` arrays, 32 bytes each: 1024 already asks a single work item for 64 KB of private memory, and past that a build spills or fails with no diagnostic worth reading. The Metal kernel has no such arrays — it keeps the same prefix products in the buffer it is going to write anyway — so the cap is there for the backend that needs it. None of these flags accepts `0` except `--work`, where it means "let the driver choose".
 
 ## `--exact` runs a different kernel
 

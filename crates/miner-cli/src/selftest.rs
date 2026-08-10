@@ -77,12 +77,6 @@ pub fn run(common: &CommonArgs) -> anyhow::Result<()> {
         } else {
             "profanity offset agreement"
         };
-        if common.backend == "metal" {
-            // open_backend rejects the mode here, and a FAIL would be saying
-            // this device is untrustworthy when the mode simply is not built.
-            println!("  skip  {name} (metal has no secp256k1 kernel)");
-            continue;
-        }
         report(&mut failures, name, profanity_agreement(contract, common));
     }
 

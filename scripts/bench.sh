@@ -26,7 +26,7 @@
 #
 #   -m  mode: create2 | create3 | 1nft | profanity          (default create3)
 #   -b  space-separated backends                            (default "opencl")
-#   -k  space-separated kernel variants                     (default "tuned")
+#   -k  space-separated kernel variants, opencl only        (default "tuned")
 #   -p  passes per contender                                (default 2)
 #   -w  warmup seconds, discarded within each run           (default 10)
 #   -d  measured seconds                                    (default 20)
@@ -103,6 +103,20 @@ mode_args() {
     esac
 }
 
+# --kernel selects one of the OpenCL keccak sources. Every other backend has
+# exactly one keccak and ignores the flag, so they are given a value that parses
+# and labelled for what they actually ran.
+kernel_arg() {
+    case "$1" in
+        opencl) printf '%s' "$2" ;;
+        *) printf 'tuned' ;;
+    esac
+}
+
+# The last run's output, kept so that a run which reported no rate can say why.
+RUNLOG=$(mktemp)
+trap 'rm -f "$RUNLOG"' EXIT INT TERM
+
 # One measurement. The miner reports a rolling-window rate while it runs and a
 # post-warmup average when it stops; the latter is what a benchmark should
 # quote, so `--warmup` is passed through and the `Measured:` line is read.
@@ -112,11 +126,27 @@ measure() {
     total=$((WARMUP + MEASURE))
     # shellcheck disable=SC2046
     "$MINER" $(mode_args) --benchmark \
-        --backend "$backend" --kernel "$kernel" \
-        --warmup "$WARMUP" --seconds "$total" 2>&1 \
-        | tr '\r' '\n' \
+        --backend "$backend" --kernel "$(kernel_arg "$backend" "$kernel")" \
+        --warmup "$WARMUP" --seconds "$total" > "$RUNLOG" 2>&1 || true
+    tr '\r' '\n' < "$RUNLOG" \
         | sed -n 's/^Measured: \([0-9.]*\) MH\/s.*/\1/p' \
         | tail -1
+}
+
+# Why a run produced no rate. Everything the miner said used to go through the
+# same pipe as the rate and be dropped by it, so a mode the backend refuses, a
+# device that was busy and a binary too old to know the flag all came out as one
+# word: FAILED. Three cooldowns and three runs to find out which, and the answer
+# had been on stderr the whole time.
+#
+# The error line rather than the last line: clap and anyhow both put the reason
+# first and boilerplate after it, so "try '--help'" is what a naive tail reports.
+failure_reason() {
+    tr '\r' '\n' < "$RUNLOG" | awk '
+        /^[Ee]rror/ { print; found = 1; exit }
+        NF { last = $0 }
+        END { if (!found) print (last == "" ? "no output" : last) }
+    '
 }
 
 DEVICE=$("$MINER" self-test --backend "$(echo "$BACKENDS" | cut -d' ' -f1)" >/dev/null 2>&1 \
@@ -131,12 +161,28 @@ fi
 CONTENDERS=""
 for backend in $BACKENDS; do
     for kernel in $KERNELS; do
-        CONTENDERS="$CONTENDERS $backend:$kernel"
+        if [ "$backend" = opencl ]; then
+            CONTENDERS="$CONTENDERS $backend:$kernel"
+            continue
+        fi
+        # One keccak, so a second -k would rerun identical work and report it
+        # as two contenders that differ by their labels alone.
+        case " $CONTENDERS " in
+            *" $backend:builtin "*) ;;
+            *) CONTENDERS="$CONTENDERS $backend:builtin" ;;
+        esac
     done
 done
 
 echo "mode=$MODE  warmup=${WARMUP}s  measured=${MEASURE}s  cooldown=${COOLDOWN}s  discarded=$DISCARD  passes=$PASSES"
 echo "contenders:$CONTENDERS"
+# Which binary, and how old. The candidate list below prefers
+# ./target/release/1miner, which is the previous build until you rebuild, and
+# benchmarking a change you have not compiled reports the change as free.
+echo "miner=$MINER (built $(date -r "$MINER" '+%Y-%m-%d %H:%M'))"
+if [ -d crates ] && [ -n "$(find crates kernels -type f -newer "$MINER" 2>/dev/null | head -1)" ]; then
+    echo "  warning: sources are newer than this binary; rebuild, or set MINER."
+fi
 echo
 
 # Whole passes thrown away, to put the machine in the state the measured passes
@@ -152,7 +198,7 @@ while [ "$discarded" -le "$DISCARD" ]; do
         printf "  %-16s " "$c"
         speed=$(measure "${c%%:*}" "${c##*:}")
         if [ -z "$speed" ]; then
-            echo "FAILED (no speed reported)"
+            echo "FAILED: $(failure_reason)"
         else
             echo "$speed MH/s (discarded)"
         fi
@@ -180,7 +226,7 @@ while [ "$pass" -le "$PASSES" ]; do
         printf "  %-16s " "$c"
         speed=$(measure "$backend" "$kernel")
         if [ -z "$speed" ]; then
-            echo "FAILED (no speed reported)"
+            echo "FAILED: $(failure_reason)"
             continue
         fi
         echo "$speed MH/s"
