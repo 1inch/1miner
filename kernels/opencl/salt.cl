@@ -39,16 +39,6 @@ typedef struct __attribute__((packed)) {
 	uchar want[20];
 } pattern;
 
-void salt_result_update(const uchar * const hash, __global result * const pResult, const uchar score, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_benchmark(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_zerobytes(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_matching(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_leading(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_range(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_leadingrange(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_mirror(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-void salt_score_doubles(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
-
 /* The salt occupies h.b[21:52], spanning words h.d[6:12]. Three of those words
  * are bumped to give every device, work-item and round a distinct salt.
  * Overflow is ignored: at the default 2**24 work-items a device would need
@@ -98,35 +88,157 @@ void salt_score_doubles(const uchar * const hash, __global result * const pResul
 	sha3_keccakf(&h);                                                     \
 	SALT_APPLY_SECOND_HASH(h)
 
-__kernel void salt_iterate(__global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	SALT_DERIVE(h)
+void salt_result_update(const uchar * const H, __global result * const pResult, const uchar score, const uchar scoreMax, const uint deviceIndex, const uint round) {
+	if (score && score > scoreMax) {
+		// One slot per score, first writer wins. The counter is a uint, and
+		// truncating it here would let every 256th writer believe it was first;
+		// two that do interleave their writes, leaving one item's salt beside
+		// another's address.
+		const uint hasResult = atomic_inc(&pResult[score].found);
+		if (hasResult == 0) {
+			// Rebuild this work-item's state to recover the salt that produced
+			// the hit. This repeats the arithmetic above rather than carrying
+			// the salt through, so the host re-derives every hit to confirm the
+			// two agree.
+			ethhash h = { .q = { SALT_INITHASH } };
+			SALT_APPLY_WORK_ITEM(h)
+
+			for (int i = 0; i < 32; ++i) {
+				pResult[score].salt[i] = h.b[i + 21];
+			}
+			for (int i = 0; i < 20; ++i) {
+				pResult[score].hash[i] = H[i];
+			}
+		}
+	}
+}
+
+/* What one candidate scores, or 0 for a candidate that does not count.
+ *
+ * Case for case the same scorer as score_address in kernels/metal/scoring.metal.
+ * The two ports are kept the same shape deliberately: when the backends
+ * disagree about an address, what settles it is reading them side by side.
+ *
+ * Returning a constant 0 for Benchmark is safe here, and deliberately unlike
+ * profanity.cl's benchmark scorer, which has to consume the address bytes. This
+ * switch reads pMode->function at run time, so the compiler must keep every
+ * branch and the hash stays live whatever this case does. profanity.cl selects
+ * at compile time through PROFANITY_SCORE_KERNEL, where a constant would let
+ * the keccak behind it be eliminated and the reported hashrate become fiction.
+ * Do not "fix" the asymmetry in either direction.
+ *
+ * A `break` below leaves the enclosing loop, not the switch: every case returns
+ * immediately after its loop, so the two readings agree anyway. */
+int salt_score(const uchar * const hash, __global const mode * const pMode) {
+	int score = 0;
 
 	switch (pMode->function) {
 	case Benchmark:
-		salt_score_benchmark(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		return 0;
+
 	case ZeroBytes:
-		salt_score_zerobytes(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 20; ++i) {
+			score += !hash[i];
+		}
+		return score;
+
 	case Matching:
-		salt_score_matching(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 20; ++i) {
+			if (pMode->data1[i] > 0 && (hash[i] & pMode->data1[i]) == pMode->data2[i]) {
+				++score;
+			}
+		}
+		return score;
+
 	case Leading:
-		salt_score_leading(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 20; ++i) {
+			if (((hash[i] & 0xF0) >> 4) == pMode->data1[0]) {
+				++score;
+			} else {
+				break;
+			}
+
+			if ((hash[i] & 0x0F) == pMode->data1[0]) {
+				++score;
+			} else {
+				break;
+			}
+		}
+		return score;
+
 	case Range:
-		salt_score_range(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 20; ++i) {
+			const uchar first = (hash[i] & 0xF0) >> 4;
+			const uchar second = (hash[i] & 0x0F);
+
+			if (first >= pMode->data1[0] && first <= pMode->data2[0]) {
+				++score;
+			}
+			if (second >= pMode->data1[0] && second <= pMode->data2[0]) {
+				++score;
+			}
+		}
+		return score;
+
 	case Mirror:
-		salt_score_mirror(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 10; ++i) {
+			const uchar leftLeft = (hash[9 - i] & 0xF0) >> 4;
+			const uchar leftRight = (hash[9 - i] & 0x0F);
+
+			const uchar rightLeft = (hash[10 + i] & 0xF0) >> 4;
+			const uchar rightRight = (hash[10 + i] & 0x0F);
+
+			if (leftRight != rightLeft) {
+				break;
+			}
+			++score;
+
+			if (leftLeft != rightRight) {
+				break;
+			}
+			++score;
+		}
+		return score;
+
 	case Doubles:
-		salt_score_doubles(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 20; ++i) {
+			if (((hash[i] & 0xF0) >> 4) == (hash[i] & 0x0F)) {
+				++score;
+			} else {
+				break;
+			}
+		}
+		return score;
+
 	case LeadingRange:
-		salt_score_leadingrange(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
-		break;
+		for (int i = 0; i < 20; ++i) {
+			const uchar first = (hash[i] & 0xF0) >> 4;
+			const uchar second = (hash[i] & 0x0F);
+
+			if (first >= pMode->data1[0] && first <= pMode->data2[0]) {
+				++score;
+			} else {
+				break;
+			}
+
+			if (second >= pMode->data1[0] && second <= pMode->data2[0]) {
+				++score;
+			} else {
+				break;
+			}
+		}
+		return score;
 	}
+
+	// A function the host never wrote scores nothing rather than whatever the
+	// last case happened to leave behind.
+	return 0;
+}
+
+__kernel void salt_iterate(__global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
+	SALT_DERIVE(h)
+
+	salt_result_update(h.b + 12, pResult, salt_score(h.b + 12, pMode), scoreMax, deviceIndex, round);
 }
 
 /* --exact: every address matching one of the masks in full, appended in arrival
@@ -180,147 +292,4 @@ __kernel void salt_iterate_exact(__global result * const pResult, __global const
 		// One address can satisfy two masks; report it once, against the first.
 		return;
 	}
-}
-
-void salt_result_update(const uchar * const H, __global result * const pResult, const uchar score, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	if (score && score > scoreMax) {
-		// One slot per score, first writer wins. The counter is a uint, and
-		// truncating it here would let every 256th writer believe it was first;
-		// two that do interleave their writes, leaving one item's salt beside
-		// another's address.
-		const uint hasResult = atomic_inc(&pResult[score].found);
-		if (hasResult == 0) {
-			// Rebuild this work-item's state to recover the salt that produced
-			// the hit. This repeats the arithmetic above rather than carrying
-			// the salt through, so the host re-derives every hit to confirm the
-			// two agree.
-			ethhash h = { .q = { SALT_INITHASH } };
-			SALT_APPLY_WORK_ITEM(h)
-
-			for (int i = 0; i < 32; ++i) {
-				pResult[score].salt[i] = h.b[i + 21];
-			}
-			for (int i = 0; i < 20; ++i) {
-				pResult[score].hash[i] = H[i];
-			}
-		}
-	}
-}
-
-/* Returning a constant 0 is safe here, and deliberately unlike profanity.cl's
- * benchmark scorer, which has to consume the address bytes. This kernel picks
- * its scorer with a runtime switch on a value read from pMode, so the compiler
- * must keep every branch and the hash above stays live whatever this one does.
- * profanity.cl selects at compile time through PROFANITY_SCORE_KERNEL, where a
- * constant would let the keccak behind it be eliminated and the reported
- * hashrate become fiction. Do not "fix" the asymmetry in either direction. */
-void salt_score_benchmark(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	salt_result_update(hash, pResult, 0, scoreMax, deviceIndex, round);
-}
-
-void salt_score_zerobytes(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 20; ++i) {
-		score += !hash[i];
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
-}
-
-void salt_score_matching(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 20; ++i) {
-		if (pMode->data1[i] > 0 && (hash[i] & pMode->data1[i]) == pMode->data2[i]) {
-			++score;
-		}
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
-}
-
-void salt_score_leading(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 20; ++i) {
-		if (((hash[i] & 0xF0) >> 4) == pMode->data1[0]) {
-			++score;
-		} else {
-			break;
-		}
-
-		if ((hash[i] & 0x0F) == pMode->data1[0]) {
-			++score;
-		} else {
-			break;
-		}
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
-}
-
-void salt_score_range(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 20; ++i) {
-		const uchar first = (hash[i] & 0xF0) >> 4;
-		const uchar second = (hash[i] & 0x0F);
-
-		if (first >= pMode->data1[0] && first <= pMode->data2[0]) {
-			++score;
-		}
-		if (second >= pMode->data1[0] && second <= pMode->data2[0]) {
-			++score;
-		}
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
-}
-
-void salt_score_leadingrange(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 20; ++i) {
-		const uchar first = (hash[i] & 0xF0) >> 4;
-		const uchar second = (hash[i] & 0x0F);
-
-		if (first >= pMode->data1[0] && first <= pMode->data2[0]) {
-			++score;
-		} else {
-			break;
-		}
-
-		if (second >= pMode->data1[0] && second <= pMode->data2[0]) {
-			++score;
-		} else {
-			break;
-		}
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
-}
-
-void salt_score_mirror(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 10; ++i) {
-		const uchar leftLeft = (hash[9 - i] & 0xF0) >> 4;
-		const uchar leftRight = (hash[9 - i] & 0x0F);
-
-		const uchar rightLeft = (hash[10 + i] & 0xF0) >> 4;
-		const uchar rightRight = (hash[10 + i] & 0x0F);
-
-		if (leftRight != rightLeft) {
-			break;
-		}
-		++score;
-
-		if (leftLeft != rightRight) {
-			break;
-		}
-		++score;
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
-}
-
-void salt_score_doubles(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	int score = 0;
-	for (int i = 0; i < 20; ++i) {
-		if (((hash[i] & 0xF0) >> 4) == (hash[i] & 0x0F)) {
-			++score;
-		} else {
-			break;
-		}
-	}
-	salt_result_update(hash, pResult, score, scoreMax, deviceIndex, round);
 }
