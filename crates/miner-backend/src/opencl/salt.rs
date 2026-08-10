@@ -20,11 +20,9 @@ use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
 use super::{DeviceId, build_program, cl_err, enumerate_devices, state_define};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
-    Backend, BackendError, DeviceInfo, Hit, Job, KeccakVariant, Reporter, Result, kernels,
+    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Hit, Job, KeccakVariant, MAX_SCORE,
+    Progress, RESULT_SLOTS, Reporter, Result, kernels,
 };
-
-/// Highest score the result buffer has a slot for.
-pub const MAX_SCORE: usize = 40;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -42,6 +40,32 @@ impl From<&ScoreSpec> for ClMode {
             data2: spec.data2,
         }
     }
+}
+
+/// One `--exact` mask, matching `pattern` in kernels/opencl/salt.cl.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ClPattern {
+    mask: [cl_uchar; 20],
+    want: [cl_uchar; 20],
+}
+
+impl From<&ScoreSpec> for ClPattern {
+    fn from(spec: &ScoreSpec) -> Self {
+        Self {
+            mask: spec.data1,
+            want: spec.data2,
+        }
+    }
+}
+
+/// The scoring mode and the exact masks are different shapes bound to the same
+/// kernel argument, so both reach the device as plain bytes.
+fn bytes_of<T>(values: &[T]) -> &[u8] {
+    // SAFETY: `T` here is only ever a `#[repr(C)]` plain-data struct with no
+    // padding that matters, the slice is borrowed for the call, and u8 has an
+    // alignment of 1, so the reinterpreted slice is in bounds and aligned.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
 #[repr(C, packed)]
@@ -90,7 +114,8 @@ impl Backend for SaltBackend {
 /// Compile-time defines for one salt job.
 fn build_options(cfg: &SaltConfig) -> String {
     let mut options = format!(
-        "-D SALT_MAX_SCORE={MAX_SCORE} -D SALT_INITHASH={}",
+        "-D SALT_MAX_SCORE={MAX_SCORE} -D SALT_EXACT_CAPACITY={EXACT_CAPACITY} \
+         -D SALT_INITHASH={}",
         state_define(&cfg.state_words())
     );
     if cfg.mode.needs_second_hash() {
@@ -115,11 +140,10 @@ fn run_salt(
     let options = build_options(cfg);
 
     let counters: Vec<AtomicU64> = ids.iter().map(|_| AtomicU64::new(0)).collect();
-    let hits: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
-    // Shared so a strong hit on one GPU raises the bar on all of them. In
-    // --exact mode the bar is pinned instead and never moves, so every full
-    // match gets reported rather than only improvements.
-    let best_score = AtomicU64::new(job.initial_threshold() as u64);
+    let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
+    // Shared so a strong hit on one GPU raises the bar on all of them. The
+    // exact path has no bar and leaves this at zero.
+    let best_score = AtomicU64::new(0);
     let failure: Mutex<Option<BackendError>> = Mutex::new(None);
     let start = Instant::now();
     let mut reported = 0usize;
@@ -187,10 +211,16 @@ fn run_salt(
     }
 }
 
-fn drain_hits(hits: &Mutex<Vec<Hit>>, from: usize, reporter: &mut dyn Reporter) -> usize {
+fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
     let guard = hits.lock().unwrap();
-    for hit in guard.iter().skip(from) {
-        reporter.on_hit(hit);
+    for found in guard.iter().skip(from) {
+        match found {
+            Progress::Hit(hit) => reporter.on_hit(hit),
+            Progress::Dropped {
+                count,
+                device_index,
+            } => reporter.on_dropped(*count, *device_index),
+        }
     }
     guard.len()
 }
@@ -204,7 +234,7 @@ fn run_device(
     source: &str,
     options: &str,
     counter: &AtomicU64,
-    hits: &Mutex<Vec<Hit>>,
+    hits: &Mutex<Vec<Progress>>,
     best_score: &AtomicU64,
     should_stop: &(dyn Fn() -> bool + Sync),
     start: Instant,
@@ -215,8 +245,14 @@ fn run_device(
         .map_err(cl_err("failed to create command queue"))?;
 
     let program = build_program(&context, &device, source, options, !job.tuning.no_cache)?;
-    let kernel =
-        Kernel::create(&program, "salt_iterate").map_err(cl_err("missing salt_iterate"))?;
+    // --exact asks a different question and so runs a different kernel over a
+    // different result layout; see the comment on `salt_iterate_exact`.
+    let kernel_name = if job.is_exact() {
+        "salt_iterate_exact"
+    } else {
+        "salt_iterate"
+    };
+    let kernel = Kernel::create(&program, kernel_name).map_err(cl_err("missing iterate kernel"))?;
 
     // SAFETY: a null host pointer with neither CL_MEM_USE_HOST_PTR nor
     // CL_MEM_COPY_HOST_PTR set asks OpenCL to own the allocation, so there is no
@@ -225,18 +261,34 @@ fn run_device(
         Buffer::<ClResult>::create(
             &context,
             CL_MEM_READ_WRITE,
-            MAX_SCORE + 1,
+            RESULT_SLOTS,
             std::ptr::null_mut(),
         )
     }
     .map_err(cl_err("failed to allocate result buffer"))?;
+
+    // One mode for scoring, or the masks for --exact. Both are read-only and
+    // uploaded once, so they share a buffer slot in the kernel's arguments.
+    let patterns: Vec<ClPattern> = job
+        .exact
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(ClPattern::from)
+        .collect();
+    let modes = [ClMode::from(&job.score)];
+    let (mode_bytes, mode_len) = if job.is_exact() {
+        (bytes_of(&patterns), patterns.len() * size_of::<ClPattern>())
+    } else {
+        (bytes_of(&modes), size_of::<ClMode>())
+    };
+
     // SAFETY: as above, OpenCL owns the allocation.
     let mut mode_buf =
-        unsafe { Buffer::<ClMode>::create(&context, CL_MEM_READ_ONLY, 1, std::ptr::null_mut()) }
+        unsafe { Buffer::<u8>::create(&context, CL_MEM_READ_ONLY, mode_len, std::ptr::null_mut()) }
             .map_err(cl_err("failed to allocate mode buffer"))?;
 
-    let mut results = vec![ClResult::default(); MAX_SCORE + 1];
-    let modes = [ClMode::from(&job.score)];
+    let mut results = vec![ClResult::default(); RESULT_SLOTS];
     // SAFETY: both writes are blocking, so the source slices only have to be
     // live for the duration of the call, and each holds exactly as many elements
     // as the buffer it fills was created with.
@@ -245,7 +297,7 @@ fn run_device(
             .enqueue_write_buffer(&mut result_buf, CL_BLOCKING, 0, &results, &[])
             .map_err(cl_err("failed to clear result buffer"))?;
         queue
-            .enqueue_write_buffer(&mut mode_buf, CL_BLOCKING, 0, &modes, &[])
+            .enqueue_write_buffer(&mut mode_buf, CL_BLOCKING, 0, mode_bytes, &[])
             .map_err(cl_err("failed to upload mode"))?;
     }
 
@@ -254,10 +306,12 @@ fn run_device(
     let chunk = job.tuning.work_max.unwrap_or(round_size).max(1);
     let local = job.tuning.work_size;
     let mut round: cl_uint = 0;
-    let mut local_best: cl_uchar = job.initial_threshold() as cl_uchar;
-    // In --exact mode the kernel's one-slot-per-score guard would suppress
-    // every match after the first, so the slot is cleared each round.
-    let zeros = vec![ClResult::default(); MAX_SCORE + 1];
+    let mut local_best: cl_uchar = 0;
+    let pattern_count = patterns.len() as cl_uint;
+    // The exact kernel appends from a counter in slot 0, so clearing it each
+    // round is the protocol rather than a workaround: it is what lets the next
+    // round start at slot 1 and what bounds the writes.
+    let zeros = vec![ClResult::default(); RESULT_SLOTS];
 
     loop {
         if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
@@ -290,16 +344,21 @@ fn run_device(
         let mut offset = 0usize;
         while offset < round_size {
             let this = chunk.min(round_size - offset);
-            // SAFETY: the argument types and their order match `salt_iterate`'s
-            // parameters in kernels/opencl/salt.cl, and every one of them —
-            // both buffers and the three scalars — outlives the enqueue, which
-            // is drained by `queue.flush()` and the event wait below.
+            // SAFETY: the argument types and their order match the parameters
+            // of whichever kernel `kernel_name` selected in
+            // kernels/opencl/salt.cl — the third differs between them, and is
+            // chosen alongside the name — and every one of them, both buffers
+            // and the three scalars, outlives the enqueue, which is drained by
+            // `queue.flush()` and the event wait below.
             unsafe {
                 let mut exec = ExecuteKernel::new(&kernel);
-                exec.set_arg(&result_buf)
-                    .set_arg(&mode_buf)
-                    .set_arg(&local_best)
-                    .set_arg(&device_index)
+                exec.set_arg(&result_buf).set_arg(&mode_buf);
+                if job.is_exact() {
+                    exec.set_arg(&pattern_count);
+                } else {
+                    exec.set_arg(&local_best);
+                }
+                exec.set_arg(&device_index)
                     .set_arg(&round)
                     .set_global_work_offset(offset)
                     .set_global_work_size(this);
@@ -319,8 +378,13 @@ fn run_device(
 
         counter.fetch_add(round_size as u64, Ordering::Relaxed);
 
-        if let Some(hit) = take_best(&results, cfg, job, info, best_score) {
-            hits.lock().unwrap().push(hit);
+        let found = if job.is_exact() {
+            drain_exact(&results, cfg, job, info)
+        } else {
+            take_best(&results, cfg, job, info, best_score)
+        };
+        if !found.is_empty() {
+            hits.lock().unwrap().extend(found);
         }
         // After take_best rather than before, because it stores when it
         // reports: one load then raises this kernel's bar to the best any
@@ -334,6 +398,41 @@ fn run_device(
     Ok(())
 }
 
+/// Build the hit a filled result slot describes.
+///
+/// The kernel rebuilds the salt separately from the hashing path, so
+/// re-deriving the address from it here is what proves the two still agree.
+fn hit_from(
+    slot: &ClResult,
+    score: u32,
+    pattern: Option<usize>,
+    cfg: &SaltConfig,
+    job: &Job,
+    info: &DeviceInfo,
+) -> Hit {
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&slot.salt);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&slot.hash);
+
+    let magic = (cfg.mode == MineMode::Nft).then(|| {
+        let mut m = [0u8; 16];
+        m.copy_from_slice(&salt[..16]);
+        m
+    });
+
+    Hit {
+        score,
+        address,
+        salt: Some(salt),
+        magic,
+        offset: None,
+        pattern,
+        device_index: info.index,
+        verified: !job.verify || cfg.address_for_salt(&salt) == address,
+    }
+}
+
 /// Result slots are indexed by score, so the best hit is the highest occupied
 /// slot above what has already been reported.
 fn take_best(
@@ -342,46 +441,66 @@ fn take_best(
     job: &Job,
     info: &DeviceInfo,
     best_score: &AtomicU64,
-) -> Option<Hit> {
+) -> Vec<Progress> {
     let threshold = best_score.load(Ordering::Relaxed);
     for score in (1..=MAX_SCORE).rev() {
         if results[score].found == 0 {
             continue;
         }
         if score as u64 <= threshold {
-            return None;
+            break;
         }
-        // --exact keeps the bar where it is so later full matches still report.
-        if !job.is_exact() {
-            best_score.store(score as u64, Ordering::Relaxed);
-        }
+        best_score.store(score as u64, Ordering::Relaxed);
+        return vec![Progress::Hit(hit_from(
+            &results[score],
+            score as u32,
+            None,
+            cfg,
+            job,
+            info,
+        ))];
+    }
+    Vec::new()
+}
 
-        let mut salt = [0u8; 32];
-        salt.copy_from_slice(&results[score].salt);
-        let mut address = [0u8; 20];
-        address.copy_from_slice(&results[score].hash);
+/// Slots are the round's matches in arrival order, with slot 0 counting them
+/// all — including any the buffer had no room for.
+fn drain_exact(
+    results: &[ClResult],
+    cfg: &SaltConfig,
+    job: &Job,
+    info: &DeviceInfo,
+) -> Vec<Progress> {
+    let total = results[0].found;
+    let stored = (total as usize).min(EXACT_CAPACITY);
 
-        // The kernel rebuilds the salt separately from the hashing path, so
-        // re-deriving here is what proves the two still agree.
-        let verified = !job.verify || cfg.address_for_salt(&salt) == address;
+    let masks = job.exact.as_deref().unwrap_or_default();
+    let mut found: Vec<Progress> = (1..=stored)
+        .map(|slot| {
+            // `found` names the mask that matched in this layout, one-based so
+            // that an untouched slot is distinguishable from mask 0.
+            let pattern = results[slot].found.saturating_sub(1) as usize;
+            let score = masks
+                .get(pattern)
+                .map_or(0, miner_core::ScoreSpec::constrained_bytes);
+            Progress::Hit(hit_from(
+                &results[slot],
+                score,
+                Some(pattern),
+                cfg,
+                job,
+                info,
+            ))
+        })
+        .collect();
 
-        let magic = (cfg.mode == MineMode::Nft).then(|| {
-            let mut m = [0u8; 16];
-            m.copy_from_slice(&salt[..16]);
-            m
-        });
-
-        return Some(Hit {
-            score: score as u32,
-            address,
-            salt: Some(salt),
-            magic,
-            offset: None,
+    if let Some(dropped) = total.checked_sub(stored as u32).filter(|d| *d > 0) {
+        found.push(Progress::Dropped {
+            count: dropped,
             device_index: info.index,
-            verified,
         });
     }
-    None
+    found
 }
 
 #[cfg(test)]
@@ -403,7 +522,7 @@ mod tests {
         .unwrap()
     }
 
-    fn job(cfg: &SaltConfig, exact_score: Option<u32>) -> Job {
+    fn job(cfg: &SaltConfig, exact: Option<Vec<ScoreSpec>>) -> Job {
         Job {
             mode: ModeConfig::Salt(cfg.clone()),
             score: ScoreSpec::zeros(),
@@ -411,19 +530,36 @@ mod tests {
             tuning: Tuning::default(),
             duration: None,
             verify: true,
-            exact_score,
+            exact,
         }
     }
 
-    /// One occupied slot, holding a salt and the address it really derives, so
-    /// the re-derivation `take_best` does has something true to agree with.
+    /// A slot holding a salt and the address it really derives, so the
+    /// re-derivation the drains do has something true to agree with.
+    fn filled(gid: u32, cfg: &SaltConfig) -> ClResult {
+        let salt = cfg.salt_at(0, gid, 1);
+        ClResult {
+            salt,
+            hash: cfg.address_for_salt(&salt),
+            found: 1,
+        }
+    }
+
+    /// One occupied slot, indexed by score as the scoring kernel writes it.
     fn results(score: usize, cfg: &SaltConfig) -> Vec<ClResult> {
-        let salt = cfg.salt_at(0, 1, 1);
-        let mut slots = vec![ClResult::default(); MAX_SCORE + 1];
-        slots[score].salt = salt;
-        slots[score].hash = cfg.address_for_salt(&salt);
-        slots[score].found = 1;
+        let mut slots = vec![ClResult::default(); RESULT_SLOTS];
+        slots[score] = filled(1, cfg);
         slots
+    }
+
+    fn hits(found: &[Progress]) -> Vec<&Hit> {
+        found
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Hit(hit) => Some(hit),
+                Progress::Dropped { .. } => None,
+            })
+            .collect()
     }
 
     fn info() -> DeviceInfo {
@@ -442,10 +578,11 @@ mod tests {
         let cfg = config();
         let shared = AtomicU64::new(0);
 
-        let hit = take_best(&results(9, &cfg), &cfg, &job(&cfg, None), &info(), &shared)
-            .expect("an occupied slot above the bar is a hit");
-        assert_eq!(hit.score, 9);
-        assert!(hit.verified);
+        let found = take_best(&results(9, &cfg), &cfg, &job(&cfg, None), &info(), &shared);
+        let hits = hits(&found);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 9);
+        assert!(hits[0].verified);
         assert_eq!(shared.load(Ordering::Relaxed), 9);
     }
 
@@ -457,22 +594,86 @@ mod tests {
         let cfg = config();
         let shared = AtomicU64::new(12);
 
-        assert!(take_best(&results(9, &cfg), &cfg, &job(&cfg, None), &info(), &shared).is_none());
+        assert!(take_best(&results(9, &cfg), &cfg, &job(&cfg, None), &info(), &shared).is_empty());
         assert_eq!(shared.load(Ordering::Relaxed), 12);
     }
 
-    /// `--exact` pins the bar so repeat full matches keep reporting. The reload
-    /// has to be a no-op there, which holds only while nothing stores.
+    /// Every match in the round comes back, not the one the buffer happened to
+    /// keep first. This is the whole point of the exact path: the scoring
+    /// layout has one slot per score, and in `--exact` every match scores the
+    /// same, so all but one used to be unrecoverable.
     #[test]
-    fn exact_mode_never_moves_the_shared_bar() {
+    fn the_exact_drain_returns_every_match_in_the_round() {
         let cfg = config();
-        let job = job(&cfg, Some(4));
-        let pinned = job.initial_threshold() as u64;
-        let shared = AtomicU64::new(pinned);
+        let masks = vec![ScoreSpec::matching("00").unwrap()];
 
-        let hit = take_best(&results(9, &cfg), &cfg, &job, &info(), &shared)
-            .expect("a full match still reports");
-        assert_eq!(hit.score, 9);
-        assert_eq!(shared.load(Ordering::Relaxed), pinned);
+        let mut slots = vec![ClResult::default(); RESULT_SLOTS];
+        for (i, gid) in (1..=5u32).enumerate() {
+            slots[i + 1] = filled(gid, &cfg);
+        }
+        slots[0].found = 5;
+
+        let found = drain_exact(&slots, &cfg, &job(&cfg, Some(masks)), &info());
+        let hits = hits(&found);
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|hit| hit.verified));
+        // Each slot carries its own work item's salt rather than a repeat of
+        // one, which is what a drain reading the wrong index would produce.
+        let salts: std::collections::HashSet<_> = hits.iter().map(|hit| hit.salt).collect();
+        assert_eq!(salts.len(), 5);
+        assert!(!found.iter().any(|p| matches!(p, Progress::Dropped { .. })));
+    }
+
+    /// Slot 0 counts every match, including the ones there was no room for, so
+    /// a round that overflows can say by how much instead of quietly losing it.
+    #[test]
+    fn the_exact_drain_reports_what_would_not_fit() {
+        let cfg = config();
+        let masks = vec![ScoreSpec::matching("00").unwrap()];
+
+        let mut slots = vec![ClResult::default(); RESULT_SLOTS];
+        for (gid, slot) in slots
+            .iter_mut()
+            .enumerate()
+            .take(EXACT_CAPACITY + 1)
+            .skip(1)
+        {
+            *slot = filled(gid as u32, &cfg);
+        }
+        slots[0].found = EXACT_CAPACITY as u32 + 44;
+
+        let found = drain_exact(&slots, &cfg, &job(&cfg, Some(masks)), &info());
+        assert_eq!(hits(&found).len(), EXACT_CAPACITY);
+        assert!(matches!(
+            found.last(),
+            Some(Progress::Dropped { count: 44, .. })
+        ));
+    }
+
+    /// Which mask matched is what identifies a hit here, since every match
+    /// scores the same. The kernel stores it one-based so an untouched slot is
+    /// not mistaken for a match on the first mask.
+    #[test]
+    fn the_exact_drain_names_the_mask_that_matched() {
+        let cfg = config();
+        let masks = vec![
+            ScoreSpec::matching("dead").unwrap(),
+            ScoreSpec::matching("beefbeef").unwrap(),
+        ];
+
+        let mut slots = vec![ClResult::default(); RESULT_SLOTS];
+        slots[1] = filled(1, &cfg);
+        slots[1].found = 1;
+        slots[2] = filled(2, &cfg);
+        slots[2].found = 2;
+        slots[0].found = 2;
+
+        let found = drain_exact(&slots, &cfg, &job(&cfg, Some(masks)), &info());
+        let hits = hits(&found);
+        assert_eq!(hits[0].pattern, Some(0));
+        assert_eq!(hits[1].pattern, Some(1));
+        // The score is the mask's own constrained-byte count, so it stays
+        // meaningful rather than repeating one number for every mask.
+        assert_eq!((hits[0].score, hits[1].score), (2, 4));
     }
 }

@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::time::Instant;
 
-use miner_core::{MineMode, ModeConfig, SaltConfig};
+use miner_core::{MineMode, ModeConfig, SaltConfig, ScoreSpec};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -22,10 +22,12 @@ use objc2_metal::{
 };
 
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{Backend, BackendError, DeviceInfo, Hit, Job, Reporter, Result};
+use crate::{
+    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Hit, Job, MAX_SCORE, Progress, RESULT_SLOTS,
+    Reporter, Result,
+};
 
-pub const MAX_SCORE: usize = 40;
-const SLOTS: usize = MAX_SCORE + 1;
+const SLOTS: usize = RESULT_SLOTS;
 
 pub const SALT_SOURCE: &str = include_str!("../../../kernels/metal/salt.metal");
 
@@ -45,6 +47,8 @@ struct MtParams {
     round: u32,
     second_hash: u32,
     score_max: u32,
+    pattern_count: u32,
+    exact_capacity: u32,
 }
 
 #[repr(C)]
@@ -53,6 +57,23 @@ struct MtResult {
     salt: [u8; 32],
     hash: [u8; 20],
     found: u32,
+}
+
+/// One `--exact` mask, matching `Pattern` in kernels/metal/salt.metal.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MtPattern {
+    mask: [u8; 20],
+    want: [u8; 20],
+}
+
+impl From<&ScoreSpec> for MtPattern {
+    fn from(spec: &ScoreSpec) -> Self {
+        Self {
+            mask: spec.data1,
+            want: spec.data2,
+        }
+    }
 }
 
 pub struct MetalBackend {
@@ -112,9 +133,16 @@ impl MetalBackend {
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .map_err(|e| BackendError::Build(format!("Metal kernel failed to compile: {e:?}")))?;
+        // --exact asks a different question and so runs a different kernel over
+        // a different result layout; see the comment on `salt_iterate_exact`.
+        let kernel_name = if job.is_exact() {
+            "salt_iterate_exact"
+        } else {
+            "salt_iterate"
+        };
         let function = library
-            .newFunctionWithName(&NSString::from_str("salt_iterate"))
-            .ok_or_else(|| BackendError::Build("salt_iterate not found in library".into()))?;
+            .newFunctionWithName(&NSString::from_str(kernel_name))
+            .ok_or_else(|| BackendError::Build(format!("{kernel_name} not found in library")))?;
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| BackendError::Build(format!("pipeline creation failed: {e:?}")))?;
@@ -134,6 +162,13 @@ impl MetalBackend {
             data1: job.score.data1,
             data2: job.score.data2,
         };
+        let patterns: Vec<MtPattern> = job
+            .exact
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(MtPattern::from)
+            .collect();
 
         let threadgroup = pipeline
             .maxTotalThreadsPerThreadgroup()
@@ -147,7 +182,7 @@ impl MetalBackend {
         let start = Instant::now();
         let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
         let mut round: u32 = 0;
-        let mut best: u32 = job.initial_threshold();
+        let mut best: u32 = 0;
         let mut hashes: u64 = 0;
 
         loop {
@@ -156,9 +191,9 @@ impl MetalBackend {
             }
             round = round.wrapping_add(1);
 
-            // The kernel keeps one slot per score and one flag per slot, so in
-            // --exact mode both are cleared each round; otherwise a repeat
-            // match at the same score would be silently dropped.
+            // The exact kernel appends from the counter in foundFlags[0], so
+            // clearing both buffers each round is the protocol rather than a
+            // workaround: it is what lets the next round start at slot 1.
             if job.is_exact() {
                 // SAFETY: both pointers come from `contents()` on a
                 // StorageModeShared buffer, and the lengths are exactly the ones
@@ -181,6 +216,8 @@ impl MetalBackend {
                 round,
                 second_hash: cfg.mode.needs_second_hash().into(),
                 score_max: best,
+                pattern_count: patterns.len() as u32,
+                exact_capacity: EXACT_CAPACITY as u32,
             };
 
             let command_buffer = queue
@@ -197,7 +234,13 @@ impl MetalBackend {
             // this iteration ends.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&results), 0, 0);
-                set_bytes(&encoder, &mode, 1);
+                // Buffer 1 is the scoring mode or the exact masks, chosen
+                // alongside the kernel name above.
+                if job.is_exact() {
+                    set_slice(&encoder, &patterns, 1);
+                } else {
+                    set_bytes(&encoder, &mode, 1);
+                }
                 set_bytes(&encoder, &params, 2);
                 encoder.setBuffer_offset_atIndex(Some(&flags), 0, 3);
             }
@@ -219,10 +262,22 @@ impl MetalBackend {
 
             hashes += job.tuning.round_size as u64;
 
-            if let Some(hit) = read_best(&results, cfg, job, best) {
-                if !job.is_exact() {
-                    best = hit.score;
+            if job.is_exact() {
+                // SAFETY: the flag buffer holds SLOTS u32s and slot 0 is the
+                // counter; the command buffer above has completed, so nothing
+                // is still writing either buffer.
+                let total = unsafe { std::ptr::read_unaligned(flags.contents().as_ptr().cast()) };
+                for found in read_exact(&results, cfg, job, total) {
+                    match found {
+                        Progress::Hit(hit) => reporter.on_hit(&hit),
+                        Progress::Dropped {
+                            count,
+                            device_index,
+                        } => reporter.on_dropped(count, device_index),
+                    }
                 }
+            } else if let Some(hit) = read_best(&results, cfg, job, best) {
+                best = hit.score;
                 reporter.on_hit(&hit);
             }
 
@@ -259,6 +314,52 @@ unsafe fn set_bytes<T>(
     unsafe { encoder.setBytes_length_atIndex(ptr, size_of::<T>(), index) };
 }
 
+/// As `set_bytes`, for an array the kernel indexes.
+///
+/// # Safety
+///
+/// `T` must have the layout the kernel expects at `index`, and the slice must
+/// hold at least as many elements as the kernel will read.
+unsafe fn set_slice<T>(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    values: &[T],
+    index: usize,
+) {
+    let ptr = NonNull::new(values.as_ptr() as *mut c_void).expect("slice pointer is never null");
+    // SAFETY: as `set_bytes`, with the length covering the whole slice, which
+    // outlives the call because Metal copies it into the command buffer.
+    unsafe { encoder.setBytes_length_atIndex(ptr, size_of_val(values), index) };
+}
+
+/// Build the hit a filled result slot describes, re-deriving the address from
+/// the salt so a kernel that reconstructed the wrong one is caught.
+fn hit_from(
+    entry: &MtResult,
+    score: u32,
+    pattern: Option<usize>,
+    cfg: &SaltConfig,
+    job: &Job,
+) -> Hit {
+    let salt = entry.salt;
+    let address = entry.hash;
+    let magic = (cfg.mode == MineMode::Nft).then(|| {
+        let mut m = [0u8; 16];
+        m.copy_from_slice(&salt[..16]);
+        m
+    });
+
+    Hit {
+        score,
+        address,
+        salt: Some(salt),
+        magic,
+        offset: None,
+        pattern,
+        device_index: 0,
+        verified: !job.verify || cfg.address_for_salt(&salt) == address,
+    }
+}
+
 fn read_best(
     results: &ProtocolObject<dyn MTLBuffer>,
     cfg: &SaltConfig,
@@ -276,27 +377,43 @@ fn read_best(
         if entry.found == 0 {
             continue;
         }
-
-        let salt = entry.salt;
-        let address = entry.hash;
-        let verified = !job.verify || cfg.address_for_salt(&salt) == address;
-        let magic = (cfg.mode == MineMode::Nft).then(|| {
-            let mut m = [0u8; 16];
-            m.copy_from_slice(&salt[..16]);
-            m
-        });
-
-        return Some(Hit {
-            score: score as u32,
-            address,
-            salt: Some(salt),
-            magic,
-            offset: None,
-            device_index: 0,
-            verified,
-        });
+        return Some(hit_from(&entry, score as u32, None, cfg, job));
     }
     None
+}
+
+/// Slots are the round's matches in arrival order; `total` is how many there
+/// were, including any the buffer had no room for.
+fn read_exact(
+    results: &ProtocolObject<dyn MTLBuffer>,
+    cfg: &SaltConfig,
+    job: &Job,
+    total: u32,
+) -> Vec<Progress> {
+    let base = results.contents().as_ptr() as *const MtResult;
+    let stored = (total as usize).min(EXACT_CAPACITY);
+    let masks = job.exact.as_deref().unwrap_or_default();
+
+    let mut found: Vec<Progress> = (1..=stored)
+        .map(|slot| {
+            // SAFETY: the buffer holds SLOTS entries and `stored` is capped at
+            // EXACT_CAPACITY, which is below it; the GPU work has completed.
+            let entry = unsafe { std::ptr::read_unaligned(base.add(slot)) };
+            // `found` names the mask that matched in this layout, one-based so
+            // an untouched slot is distinguishable from mask 0.
+            let pattern = entry.found.saturating_sub(1) as usize;
+            let score = masks.get(pattern).map_or(0, ScoreSpec::constrained_bytes);
+            Progress::Hit(hit_from(&entry, score, Some(pattern), cfg, job))
+        })
+        .collect();
+
+    if let Some(dropped) = total.checked_sub(stored as u32).filter(|d| *d > 0) {
+        found.push(Progress::Dropped {
+            count: dropped,
+            device_index: 0,
+        });
+    }
+    found
 }
 
 /// Metal supports the salt modes only.
@@ -312,8 +429,9 @@ mod tests {
     fn struct_layouts_match_the_kernel() {
         assert_eq!(size_of::<MtMode>(), 44);
         assert_eq!(size_of::<MtResult>(), 56);
-        // 25 lanes plus four 32-bit fields.
-        assert_eq!(size_of::<MtParams>(), 200 + 16);
+        assert_eq!(size_of::<MtPattern>(), 40);
+        // 25 lanes plus six 32-bit fields.
+        assert_eq!(size_of::<MtParams>(), 200 + 24);
     }
 
     #[test]

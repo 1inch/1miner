@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use miner_core::{ModeConfig, ProfanityConfig, ScoreFn, secp256k1::generator_table};
+use miner_core::{ModeConfig, ProfanityConfig, ScoreFn, ScoreSpec, secp256k1::generator_table};
 use opencl3::command_queue::CommandQueue;
 use opencl3::context::Context;
 use opencl3::device::Device;
@@ -30,10 +30,9 @@ use rand::RngCore;
 use super::{DeviceId, build_program, cl_err, enumerate_devices};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
-    Backend, BackendError, DeviceInfo, Hit, Job, KeccakVariant, Reporter, Result, kernels,
+    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Hit, Job, KeccakVariant, MAX_SCORE,
+    Progress, RESULT_SLOTS, Reporter, Result, kernels,
 };
-
-pub const MAX_SCORE: usize = 40;
 
 /// `mp_number` from profanity2's types.hpp: eight 32-bit words, 16-byte aligned.
 #[repr(C, align(16))]
@@ -101,7 +100,17 @@ pub fn program_source(keccak: KeccakVariant) -> String {
     format!("{}\n{}", keccak.source(), kernels::PROFANITY)
 }
 
-fn iterate_kernel_name(function: ScoreFn) -> &'static str {
+/// Which iterate kernel a job runs. `--exact` asks a different question and so
+/// runs a different kernel over a different result layout; see the comment on
+/// `profanity_iterate_exact_match`.
+fn iterate_kernel_name(job: &Job) -> &'static str {
+    if job.is_exact() {
+        return "profanity_iterate_exact_match";
+    }
+    score_kernel_name(job.score.function)
+}
+
+fn score_kernel_name(function: ScoreFn) -> &'static str {
     match function {
         ScoreFn::Benchmark => "profanity_iterate_score_benchmark",
         ScoreFn::ZeroBytes => "profanity_iterate_score_zerobytes",
@@ -202,7 +211,8 @@ fn run_profanity(
 
     let source = program_source(job.keccak);
     let options = format!(
-        "-D PROFANITY_INVERSE_SIZE={} -D PROFANITY_MAX_SCORE={MAX_SCORE}",
+        "-D PROFANITY_INVERSE_SIZE={} -D PROFANITY_MAX_SCORE={MAX_SCORE} \
+         -D PROFANITY_EXACT_CAPACITY={EXACT_CAPACITY}",
         job.tuning.inverse_size
     );
 
@@ -220,8 +230,9 @@ fn run_profanity(
         .collect();
 
     let counters: Vec<AtomicU64> = ids.iter().map(|_| AtomicU64::new(0)).collect();
-    let hits: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
-    let best_score = AtomicU64::new(job.initial_threshold() as u64);
+    let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
+    // The exact path has no bar and leaves this at zero.
+    let best_score = AtomicU64::new(0);
     let failure: Mutex<Option<BackendError>> = Mutex::new(None);
     let start = Instant::now();
     let mut reported = 0usize;
@@ -297,10 +308,16 @@ fn to_mp(be: &[u8; 32]) -> MpNumber {
     MpNumber { d }
 }
 
-fn drain_hits(hits: &Mutex<Vec<Hit>>, from: usize, reporter: &mut dyn Reporter) -> usize {
+fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
     let guard = hits.lock().unwrap();
-    for hit in guard.iter().skip(from) {
-        reporter.on_hit(hit);
+    for found in guard.iter().skip(from) {
+        match found {
+            Progress::Hit(hit) => reporter.on_hit(hit),
+            Progress::Dropped {
+                count,
+                device_index,
+            } => reporter.on_dropped(*count, *device_index),
+        }
     }
     guard.len()
 }
@@ -315,7 +332,7 @@ fn run_device(
     options: &str,
     precomp: &[ClPoint],
     counter: &AtomicU64,
-    hits: &Mutex<Vec<Hit>>,
+    hits: &Mutex<Vec<Progress>>,
     best_score: &AtomicU64,
     should_stop: &(dyn Fn() -> bool + Sync),
     start: Instant,
@@ -330,9 +347,21 @@ fn run_device(
         Kernel::create(&program, "profanity_init").map_err(cl_err("missing profanity_init"))?;
     let kernel_inverse = Kernel::create(&program, "profanity_inverse")
         .map_err(cl_err("missing profanity_inverse"))?;
-    let iterate_name = iterate_kernel_name(job.score.function);
+    let iterate_name = iterate_kernel_name(job);
     let kernel_iterate =
         Kernel::create(&program, iterate_name).map_err(cl_err("missing iterate kernel"))?;
+
+    // Scoring reads one mask from each; the exact kernel reads `patterns.len()`
+    // of them laid end to end.
+    let patterns = job.exact.as_deref().unwrap_or_default();
+    let (data1, data2): (Vec<cl_uchar>, Vec<cl_uchar>) = if job.is_exact() {
+        (
+            patterns.iter().flat_map(|p| p.data1).collect(),
+            patterns.iter().flat_map(|p| p.data2).collect(),
+        )
+    } else {
+        (job.score.data1.to_vec(), job.score.data2.to_vec())
+    };
 
     let size = job.tuning.profanity_round_size();
 
@@ -368,21 +397,33 @@ fn run_device(
         Buffer::<ClResult>::create(
             &context,
             CL_MEM_READ_WRITE,
-            MAX_SCORE + 1,
+            RESULT_SLOTS,
             std::ptr::null_mut(),
         )
     }
     .map_err(cl_err("failed to allocate result buffer"))?;
     // SAFETY: as above.
-    let mut mem_data1 =
-        unsafe { Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, 20, std::ptr::null_mut()) }
-            .map_err(cl_err("failed to allocate data1"))?;
+    let mut mem_data1 = unsafe {
+        Buffer::<cl_uchar>::create(
+            &context,
+            CL_MEM_READ_ONLY,
+            data1.len(),
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(cl_err("failed to allocate data1"))?;
     // SAFETY: as above.
-    let mut mem_data2 =
-        unsafe { Buffer::<cl_uchar>::create(&context, CL_MEM_READ_ONLY, 20, std::ptr::null_mut()) }
-            .map_err(cl_err("failed to allocate data2"))?;
+    let mut mem_data2 = unsafe {
+        Buffer::<cl_uchar>::create(
+            &context,
+            CL_MEM_READ_ONLY,
+            data2.len(),
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(cl_err("failed to allocate data2"))?;
 
-    let mut results = vec![ClResult::default(); MAX_SCORE + 1];
+    let mut results = vec![ClResult::default(); RESULT_SLOTS];
     // SAFETY: all four writes are blocking, so each source only has to be live
     // for the duration of its call, and each holds exactly as many elements as
     // the buffer it fills was created with.
@@ -394,10 +435,10 @@ fn run_device(
             .enqueue_write_buffer(&mut mem_result, CL_BLOCKING, 0, &results, &[])
             .map_err(cl_err("failed to clear results"))?;
         queue
-            .enqueue_write_buffer(&mut mem_data1, CL_BLOCKING, 0, &job.score.data1, &[])
+            .enqueue_write_buffer(&mut mem_data1, CL_BLOCKING, 0, &data1, &[])
             .map_err(cl_err("failed to upload data1"))?;
         queue
-            .enqueue_write_buffer(&mut mem_data2, CL_BLOCKING, 0, &job.score.data2, &[])
+            .enqueue_write_buffer(&mut mem_data2, CL_BLOCKING, 0, &data2, &[])
             .map_err(cl_err("failed to upload data2"))?;
     }
 
@@ -439,9 +480,12 @@ fn run_device(
     queue.finish().map_err(cl_err("initialization failed"))?;
 
     let mut round: u64 = 0;
-    let mut local_best: cl_uchar = job.initial_threshold() as cl_uchar;
-    // --exact needs the per-score slot cleared so repeat full matches record.
-    let zeros = vec![ClResult::default(); MAX_SCORE + 1];
+    let mut local_best: cl_uchar = 0;
+    let pattern_count = patterns.len() as cl_uint;
+    // The exact kernel appends from a counter in slot 0, so clearing it each
+    // round is the protocol rather than a workaround: it is what lets the next
+    // round start at slot 1 and what bounds the writes.
+    let zeros = vec![ClResult::default(); RESULT_SLOTS];
 
     loop {
         if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
@@ -493,16 +537,21 @@ fn run_device(
             // SAFETY: the arguments and their order match the iterate kernel
             // selected by `iterate_kernel_name`, and every buffer and scalar is
             // captured by reference from this function's scope, so all of them
-            // outlive the enqueues the closure feeds.
+            // outlive the enqueues the closure feeds. The seventh differs
+            // between the two kernels and is chosen the same way the name was.
             |exec| unsafe {
                 exec.set_arg(&mem_delta_x)
                     .set_arg(&mem_inversed)
                     .set_arg(&mem_prev_lambda)
                     .set_arg(&mem_result)
                     .set_arg(&mem_data1)
-                    .set_arg(&mem_data2)
-                    .set_arg(&local_best)
-                    .set_arg(&is_contract);
+                    .set_arg(&mem_data2);
+                if job.is_exact() {
+                    exec.set_arg(&pattern_count);
+                } else {
+                    exec.set_arg(&local_best);
+                }
+                exec.set_arg(&is_contract);
             },
         )?;
 
@@ -512,10 +561,75 @@ fn run_device(
         round += 1;
         counter.fetch_add(size as u64, Ordering::Relaxed);
 
-        let threshold = best_score.load(Ordering::Relaxed);
-        // Every device's progress, not just this one's, so a device that is
-        // behind stops writing results the host reads and throws away.
-        local_best = threshold as cl_uchar;
+        let context = RoundContext {
+            cfg,
+            job,
+            info,
+            seed: &seed,
+            round,
+        };
+        let found = if job.is_exact() {
+            context.drain_exact(&results)
+        } else {
+            let threshold = best_score.load(Ordering::Relaxed);
+            // Every device's progress, not just this one's, so a device that is
+            // behind stops writing results the host reads and throws away.
+            local_best = threshold as cl_uchar;
+            match context.take_best(&results, threshold) {
+                Some((score, hit)) => {
+                    best_score.store(u64::from(score), Ordering::Relaxed);
+                    local_best = score as cl_uchar;
+                    vec![Progress::Hit(hit)]
+                }
+                None => Vec::new(),
+            }
+        };
+        if !found.is_empty() {
+            hits.lock().unwrap().extend(found);
+        }
+    }
+
+    queue.finish().map_err(cl_err("finish failed"))?;
+    Ok(())
+}
+
+/// What turning a result slot into a `Hit` needs beyond the slot itself.
+struct RoundContext<'a> {
+    cfg: &'a ProfanityConfig,
+    job: &'a Job,
+    info: &'a DeviceInfo,
+    seed: &'a ClUlong4,
+    round: u64,
+}
+
+impl RoundContext<'_> {
+    /// Build the hit a filled result slot describes.
+    ///
+    /// The offset is rebuilt from the seed, the round and the work-item id
+    /// rather than read off the kernel, so walking the seed public key forward
+    /// by it and comparing is what catches offset accounting that has gone
+    /// wrong — which would otherwise hand over a key controlling a different
+    /// address.
+    fn hit_from(&self, slot: &ClResult, score: u32, pattern: Option<usize>) -> Hit {
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&slot.found_hash);
+        let offset = offset_scalar(self.seed, self.round, slot.found_id);
+
+        Hit {
+            score,
+            address,
+            salt: None,
+            magic: None,
+            offset: Some(offset),
+            pattern,
+            device_index: self.info.index,
+            verified: !self.job.verify || self.cfg.address_for_offset(&offset) == Some(address),
+        }
+    }
+
+    /// Result slots are indexed by score, so the best hit is the highest
+    /// occupied slot above what has already been reported.
+    fn take_best(&self, results: &[ClResult], threshold: u64) -> Option<(u32, Hit)> {
         for score in (1..=MAX_SCORE).rev() {
             if results[score].found == 0 {
                 continue;
@@ -523,35 +637,39 @@ fn run_device(
             if score as u64 <= threshold {
                 break;
             }
-            if !job.is_exact() {
-                best_score.store(score as u64, Ordering::Relaxed);
-                local_best = score as cl_uchar;
-            }
-
-            let mut address = [0u8; 20];
-            address.copy_from_slice(&results[score].found_hash);
-            let offset = offset_scalar(&seed, round, results[score].found_id);
-
-            // Walk the seed public key forward by the reported offset and check
-            // it lands on the reported address. A mismatch means the offset
-            // accounting is wrong and the key would be useless.
-            let verified = !job.verify || cfg.address_for_offset(&offset) == Some(address);
-
-            hits.lock().unwrap().push(Hit {
-                score: score as u32,
-                address,
-                salt: None,
-                magic: None,
-                offset: Some(offset),
-                device_index: info.index,
-                verified,
-            });
-            break;
+            return Some((
+                score as u32,
+                self.hit_from(&results[score], score as u32, None),
+            ));
         }
+        None
     }
 
-    queue.finish().map_err(cl_err("finish failed"))?;
-    Ok(())
+    /// Slots are the round's matches in arrival order, with slot 0 counting
+    /// them all — including any the buffer had no room for.
+    fn drain_exact(&self, results: &[ClResult]) -> Vec<Progress> {
+        let total = results[0].found;
+        let stored = (total as usize).min(EXACT_CAPACITY);
+        let masks = self.job.exact.as_deref().unwrap_or_default();
+
+        let mut found: Vec<Progress> = (1..=stored)
+            .map(|slot| {
+                // `found` names the mask that matched in this layout, one-based
+                // so an untouched slot is distinguishable from mask 0.
+                let pattern = results[slot].found.saturating_sub(1) as usize;
+                let score = masks.get(pattern).map_or(0, ScoreSpec::constrained_bytes);
+                Progress::Hit(self.hit_from(&results[slot], score, Some(pattern)))
+            })
+            .collect();
+
+        if let Some(dropped) = total.checked_sub(stored as u32).filter(|d| *d > 0) {
+            found.push(Progress::Dropped {
+                count: dropped,
+                device_index: self.info.index,
+            });
+        }
+        found
+    }
 }
 
 /// Split a launch into `work_max` sized pieces, as the reference dispatcher does.

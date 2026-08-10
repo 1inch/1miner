@@ -161,9 +161,14 @@ pub struct ScoringArgs {
     #[arg(long)]
     pub trailing: Option<String>,
     /// Report every address matching the mask in full, rather than climbing
-    /// towards a best score. Non-hex characters are wildcards.
+    /// towards a best score. Non-hex characters are wildcards. Repeatable, to
+    /// search for several at once at almost no cost per extra mask.
     #[arg(long, short = 'e')]
-    pub exact: Option<String>,
+    pub exact: Vec<String>,
+    /// File of --exact masks, one per line. Blank lines and lines beginning
+    /// with # are ignored.
+    #[arg(long = "exact-file")]
+    pub exact_file: Option<String>,
     /// Score a leading run of nibbles within --min..=--max.
     #[arg(long = "leading-range")]
     pub leading_range: bool,
@@ -283,15 +288,59 @@ impl CommonArgs {
     }
 }
 
-/// A resolved scoring choice: the specification the kernels take, plus the
-/// all-or-nothing threshold when `--exact` was used.
+/// A resolved scoring choice: the specification the kernels take, and the masks
+/// when `--exact` was used, which select a different kernel entirely.
 #[derive(Debug, Clone)]
 pub struct Scoring {
     pub spec: ScoreSpec,
-    pub exact_score: Option<u32>,
+    /// The `--exact` masks, each with the text it was written as, because a
+    /// mask is what identifies a hit in that mode and a score no longer does.
+    pub exact: Option<Vec<(String, ScoreSpec)>>,
 }
 
 impl ScoringArgs {
+    /// Every `--exact` mask, from whichever of the two forms was used.
+    fn exact_masks(&self) -> anyhow::Result<Vec<(String, ScoreSpec)>> {
+        // One list from one place, as `--init-code` and `--init-code-file` are
+        // one init code from one place: combining them would leave the set that
+        // was actually searched somewhere other than the command line.
+        if !self.exact.is_empty() && self.exact_file.is_some() {
+            anyhow::bail!("give only one of --exact, --exact-file");
+        }
+
+        let patterns: Vec<String> = match &self.exact_file {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("cannot read masks from {path}: {e}"))?;
+                let masks: Vec<String> = text
+                    .lines()
+                    .map(|line| line.split('#').next().unwrap_or_default().trim())
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                if masks.is_empty() {
+                    anyhow::bail!("{path} holds no masks");
+                }
+                masks
+            }
+            None => self.exact.clone(),
+        };
+
+        patterns
+            .into_iter()
+            .map(|pattern| {
+                let spec = ScoreSpec::matching(&pattern)?;
+                if spec.constrained_bytes() == 0 {
+                    anyhow::bail!(
+                        "--exact needs at least one hex digit to match against, and {pattern:?} \
+                         is all wildcards, which matches everything"
+                    );
+                }
+                Ok((pattern, spec))
+            })
+            .collect()
+    }
+
     /// Resolve to exactly one scoring specification, or explain what is wrong.
     pub fn resolve(&self) -> anyhow::Result<Scoring> {
         let mut chosen: Vec<(&str, ScoreSpec)> = Vec::new();
@@ -326,8 +375,12 @@ impl ScoringArgs {
         if let Some(p) = &self.trailing {
             chosen.push(("--trailing", ScoreSpec::trailing(p)?));
         }
-        if let Some(p) = &self.exact {
-            chosen.push(("--exact", ScoreSpec::matching(p)?));
+        // However many masks were given, they are one choice of what to search
+        // for. The first stands in as the job's nominal spec; the exact kernels
+        // read the whole list instead.
+        let exact = self.exact_masks()?;
+        if let Some((_, first)) = exact.first() {
+            chosen.push(("--exact", *first));
         }
         let min = self.min.unwrap_or(0);
         let max = self.max.unwrap_or(15);
@@ -361,19 +414,8 @@ impl ScoringArgs {
                     }
                 }
 
-                let exact_score = if name == "--exact" {
-                    let needed = spec.constrained_bytes();
-                    if needed == 0 {
-                        anyhow::bail!(
-                            "--exact needs at least one hex digit to match against; \
-                             a mask of only wildcards matches everything"
-                        );
-                    }
-                    Some(needed)
-                } else {
-                    None
-                };
-                Ok(Scoring { spec, exact_score })
+                let exact = (name == "--exact").then_some(exact);
+                Ok(Scoring { spec, exact })
             }
             0 => anyhow::bail!(
                 "choose a scoring mode, for example --leading 0, --matching dead, --zeros or --benchmark"
@@ -574,6 +616,49 @@ mod tests {
         };
         let spec = unbounded.resolve().unwrap().spec;
         assert_eq!((spec.data1[0], spec.data2[0]), (0, 15));
+    }
+
+    /// Several masks are one choice of what to search for, however many there
+    /// are, so `resolve` still has to see exactly one scoring mode.
+    #[test]
+    fn exact_takes_several_masks_from_one_source() {
+        let two = ScoringArgs {
+            exact: vec!["dead".into(), "beef".into()],
+            ..Default::default()
+        };
+        let masks = two.resolve().unwrap().exact.expect("exact was given");
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[0].0, "dead");
+        assert_eq!(masks[1].1, ScoreSpec::matching("beef").unwrap());
+
+        // A mask that constrains nothing would report every address there is.
+        let wildcards = ScoringArgs {
+            exact: vec!["XXXX".into()],
+            ..Default::default()
+        };
+        assert!(wildcards.resolve().is_err());
+
+        // Still one scoring mode, so a second one is still a conflict.
+        let conflicting = ScoringArgs {
+            exact: vec!["dead".into(), "beef".into()],
+            zeros: true,
+            ..Default::default()
+        };
+        let err = conflicting.resolve().unwrap_err().to_string();
+        assert!(err.contains("--exact") && err.contains("--zeros"), "{err}");
+
+        let both_forms = ScoringArgs {
+            exact: vec!["dead".into()],
+            exact_file: Some("masks.txt".into()),
+            ..Default::default()
+        };
+        assert!(
+            both_forms
+                .resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("give only one of")
+        );
     }
 
     #[test]

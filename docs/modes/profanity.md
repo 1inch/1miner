@@ -52,7 +52,8 @@ What `Score` counts is not the same in every mode, which is worth knowing before
 | --- | --- |
 | `--leading`, `--leading-range`, `--mirror` | matching hex digits, stopping at the first miss |
 | `--zeros`, `--letters`, `--numbers`, `--range` | matching hex digits anywhere in the address |
-| `--matching`, `--trailing`, `--exact` | satisfied bytes of the mask, so at most 20 |
+| `--matching`, `--trailing` | satisfied bytes of the mask, so at most 20 |
+| `--exact` | nothing; it reports the mask that matched instead |
 | `--zero-bytes`, `--leading-doubles` | whole bytes, anywhere and leading respectively |
 | `--benchmark` | nothing; it never scores or reports |
 
@@ -117,9 +118,31 @@ Because only improvements are printed, once an address has satisfied every fixed
 1miner profanity --public-key "$PROFANITY_PUBKEY" --exact XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXbeef
 ```
 
-It says at the start how many bytes have to match, and the score column then stops moving, because there is only one score worth having. Expect the first result to take longer to appear than with `--matching`, which reports its near misses on the way; here there are no near misses. This is the mode to use when you want several candidates to pick between rather than one.
+The score column is replaced by the mask that matched, because every match satisfies the whole mask and so scores the same. Expect the first result to take longer to appear than with `--matching`, which reports its near misses on the way; here there are no near misses. This is the mode to use when you want several candidates to pick between rather than one.
 
-A device reports at most one match per round, and a round is about 4.2 million candidates on the default geometry. A mask of six digits or more comes up less often than that, so nothing is lost. Below it most of the matches are simply never shown, which is one more reason not to mine a pattern you would hit by accident.
+Each device hands back up to 256 matches per round, a round being about 4.2 million candidates on the default geometry. That is far more than a mask of five digits or longer produces, so in practice nothing is lost. On a mask loose enough to overflow it, the line
+
+```
+         (+3840 more this round on GPU0, not kept)
+```
+
+says exactly how many went unreported, so a run is never quietly discarding results.
+
+#### Several masks at once — repeat `--exact`
+
+The comparison costs almost nothing beside the hashing, so searching for several masks in one pass runs at the same rate as searching for one:
+
+```bash
+1miner profanity --public-key "$PROFANITY_PUBKEY" --exact dead --exact beef --exact c0de
+```
+
+Each hit names the mask it matched. For a longer list, `--exact-file` reads one mask per line, ignoring blank lines and anything after a `#`:
+
+```bash
+1miner profanity --public-key "$PROFANITY_PUBKEY" --exact-file masks.txt
+```
+
+Give one form or the other, not both: the list has to be somewhere a reader can find it, and half on the command line and half in a file is neither. An address satisfying two masks is reported once, against the first of them.
 
 ### Character classes anywhere — `--zeros`, `--letters`, `--numbers`
 

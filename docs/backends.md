@@ -70,3 +70,9 @@ A new kernel that is fast and wrong is the failure this project is arranged to p
 For profanity, `--inverse-size` times `--inverse-multiple` is both the number of points per round and the driver of memory use: three scratch buffers of 32 bytes per point, so the default 4.2M points needs roughly 400 MB. Lower `-I` first if a device runs out of memory or takes too long to initialise.
 
 `--inverse-size` is capped at 1024 because it becomes the length of two private `mp_number` arrays in the kernel, 32 bytes each: 1024 already asks a single work item for 64 KB of private memory, and past that a build spills or fails with no diagnostic worth reading. None of these flags accepts `0` except `--work`, where it means "let the driver choose".
+
+## `--exact` runs a different kernel
+
+Scoring and `--exact` ask different questions, and each has its own kernel and its own result buffer. Scoring wants the best candidate so far, so its buffer holds one slot per score and a climbing bar stops the kernel writing anything worse. `--exact` wants every candidate that matched, which is a list: matches are appended in arrival order, there is no bar, and the count of them is what the host reads first.
+
+The list holds 256 matches per round per device. Every one recovered is reported, and a round that finds more says by how many it overflowed rather than discarding the rest in silence. The number is not tunable: at five constrained digits or more a round produces fewer matches than that anyway, and below it the limit is doing you a favour, since the alternative is thousands of lines a second.

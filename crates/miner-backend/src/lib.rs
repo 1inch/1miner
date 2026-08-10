@@ -132,28 +132,40 @@ pub struct Job {
     pub duration: Option<Duration>,
     /// Re-derive every hit on the CPU before reporting it.
     pub verify: bool,
-    /// All-or-nothing mode (`--exact`). When set, only candidates reaching this
-    /// score are reported, the bar never rises, and every subsequent match is
-    /// reported rather than just improvements on the best seen.
-    pub exact_score: Option<u32>,
+    /// The masks `--exact` searches for, or `None` for ordinary scoring.
+    ///
+    /// This selects a different question and therefore a different kernel and a
+    /// different result layout, rather than a variation on scoring: scoring
+    /// asks for the best candidate so far, and `--exact` asks for everyone who
+    /// matched. Only `data1` and `data2` of each spec are read; the function
+    /// is not, since the exact kernels do not score.
+    pub exact: Option<Vec<ScoreSpec>>,
 }
 
 impl Job {
-    /// The score a candidate must beat to be worth recording, and whether the
-    /// bar rises as better candidates arrive.
-    ///
-    /// Ordinary scoring keeps the best found so far, so the bar climbs and each
-    /// line printed is an improvement. `--exact` pins the bar just below the
-    /// full match instead, so the kernel records nothing else and every full
-    /// match gets reported.
-    pub fn initial_threshold(&self) -> u32 {
-        self.exact_score.map_or(0, |n| n.saturating_sub(1))
-    }
-
     pub fn is_exact(&self) -> bool {
-        self.exact_score.is_some()
+        self.exact.is_some()
     }
 }
+
+/// How many matches one round on one device can hand back in `--exact`.
+///
+/// Everything recovered is reported, and a round that finds more says by how
+/// many it overflowed, so this one number bounds both the buffer and the output.
+/// It is deliberately not `MAX_SCORE`, which is 40 because an address has 40
+/// nibbles and has nothing to say about how many matches a round can hold.
+pub const EXACT_CAPACITY: usize = 256;
+
+/// Slots in a result buffer: one counter plus whichever layout is in use.
+pub const RESULT_SLOTS: usize = 1 + if MAX_SCORE > EXACT_CAPACITY {
+    MAX_SCORE
+} else {
+    EXACT_CAPACITY
+};
+
+/// Highest score a result buffer has a slot for, which is every nibble of an
+/// address matching.
+pub const MAX_SCORE: usize = 40;
 
 /// A candidate that beat the previous best score.
 #[derive(Debug, Clone)]
@@ -166,9 +178,29 @@ pub struct Hit {
     pub magic: Option<[u8; 16]>,
     /// profanity: the offset to add to the seed private key.
     pub offset: Option<[u8; 32]>,
+    /// `--exact`: which of the masks this address matched. `score` is the same
+    /// number for every match there and so says nothing; this is what does.
+    pub pattern: Option<usize>,
     pub device_index: usize,
     /// Whether the CPU agreed this address follows from the reported inputs.
     pub verified: bool,
+}
+
+/// What a device thread hands back to the run loop.
+///
+/// A device cannot reach the reporter directly — several of them run at once
+/// and the reporter is not shared — so findings queue up and the run loop
+/// drains them. Drops travel in the same queue as hits rather than in a counter
+/// of their own, which is what keeps a round's overflow line beside the round
+/// that overflowed.
+#[derive(Debug, Clone)]
+pub enum Progress {
+    Hit(Hit),
+    /// Matches this round found beyond what the result buffer could keep.
+    Dropped {
+        count: u32,
+        device_index: usize,
+    },
 }
 
 /// Progress callbacks, invoked from the run loop.
@@ -179,6 +211,10 @@ pub trait Reporter: Send {
     /// The post-warmup average, reported once when the run ends. This is the
     /// figure a benchmark should quote, since the live rate is a short window.
     fn on_summary(&mut self, _summary: &crate::speed::SpeedSummary) {}
+    /// Matches a round found beyond what the result buffer could keep. Reported
+    /// so that a run which is discarding results says so rather than looking
+    /// like one where matches are simply rare.
+    fn on_dropped(&mut self, _count: u32, _device_index: usize) {}
 }
 
 #[derive(Debug, Clone)]

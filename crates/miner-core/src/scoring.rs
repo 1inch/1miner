@@ -160,6 +160,26 @@ impl ScoreSpec {
     }
 }
 
+/// Whether an address satisfies every byte a mask constrains.
+///
+/// This is the question `--exact` asks, and it is not the scoring one: there is
+/// no partial credit and no bar, so it is written as a plain byte comparison
+/// rather than by testing `score` against `constrained_bytes`. A wildcard has a
+/// zero mask byte and a zero want byte, so it compares equal whatever the
+/// address holds.
+pub fn matches_exactly(spec: &ScoreSpec, address: &Address) -> bool {
+    address
+        .iter()
+        .zip(spec.data1.iter().zip(spec.data2.iter()))
+        .all(|(byte, (mask, want))| byte & mask == *want)
+}
+
+/// Which of the masks an address satisfies in full, taking the first when it
+/// satisfies more than one, as the kernels do.
+pub fn first_exact_match(specs: &[ScoreSpec], address: &Address) -> Option<usize> {
+    specs.iter().position(|spec| matches_exactly(spec, address))
+}
+
 enum Anchor {
     Start,
     End,

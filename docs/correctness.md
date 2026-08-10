@@ -42,6 +42,10 @@ Worth running on a freshly rented box before committing it to a long job. It tak
 
 **Cross-backend planted targets.** For each of create2, create3 and 1nft, a work item is chosen, its address computed on the CPU, and a full 20-byte mask built from it. The backend must find exactly that work item and report the matching salt. Passing exercises the pre-image construction, the keccak padding, the second CREATE hash, the scoring and the kernel's separate salt-reconstruction path all at once. Run against CPU, OpenCL and Metal.
 
+**`--exact` returns a whole round.** The assertion is a count, not a presence: a mask of one nibble matches about one candidate in sixteen, so a round yields hundreds, and the test requires far more hits than the number of rounds. That is what separates the append-style buffer from the one-slot-per-score layout, which could only ever return one per round — and the earlier test, which asked only that matches kept arriving, passed against both. Where a round overflows the 256-match buffer, the overflow has to be reported. Run against CPU, OpenCL and Metal, and separately against the profanity kernel, whose exact path derives its addresses through secp256k1 rather than keccak alone.
+
+**Several masks in one pass.** Three disjoint masks, with every hit required to satisfy the one it was reported against and all three required to have matched something. The second half is what catches a kernel that tests only the first mask.
+
 **The secp256k1 kernel.** No target can be planted for profanity, so it is checked the way `self-test` checks it: a short search on a small round, with every offset the kernel reports required to name the address reported with it, in both plain and `--contract` shape. Then one of those offsets is handed to the CPU walk as its starting point. The kernel's field arithmetic is OpenCL C and the host's is Rust, so that last step is two implementations agreeing on one scalar rather than one checked against itself — the claim the salt modes get from their planted targets.
 
 **Keccak variant equivalence.** Both permutations must find the same address for the same work item.

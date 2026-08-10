@@ -18,7 +18,7 @@ pub use address::{
 };
 pub use hexutil::{parse_address, parse_hash, parse_hex, parse_magic, to_checksum_address};
 pub use mode::{MineMode, ModeConfig, ProfanityConfig, SaltConfig};
-pub use scoring::{ScoreFn, ScoreSpec, score};
+pub use scoring::{ScoreFn, ScoreSpec, first_exact_match, matches_exactly, score};
 
 use sha3::{Digest, Keccak256};
 

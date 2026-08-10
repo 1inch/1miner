@@ -13,18 +13,24 @@ pub struct TerminalReporter {
     mode: MineMode,
     start: Instant,
     quiet: bool,
+    /// The `--exact` masks as they were written, indexed by `Hit::pattern`.
+    masks: Vec<String>,
     pub hits: usize,
     pub unverified: usize,
+    /// Matches the result buffers could not keep, across the whole run.
+    pub dropped: u64,
 }
 
 impl TerminalReporter {
-    pub fn new(mode: MineMode, quiet: bool) -> Self {
+    pub fn new(mode: MineMode, quiet: bool, masks: Vec<String>) -> Self {
         Self {
             mode,
             start: Instant::now(),
             quiet,
+            masks,
             hits: 0,
             unverified: 0,
+            dropped: 0,
         }
     }
 }
@@ -59,13 +65,28 @@ impl Reporter for TerminalReporter {
             "  [UNVERIFIED: CPU re-derivation disagrees with the kernel]".to_string()
         };
 
+        // Under --exact every match scores the same, so the score says nothing
+        // and which mask matched says everything.
+        let what = match hit.pattern.and_then(|i| self.masks.get(i)) {
+            Some(mask) => format!("Mask: {mask:>6}"),
+            None => format!("Score: {:>2}", hit.score),
+        };
+
         print!("{CLEAR_LINE}");
         println!(
-            "  Time: {seconds:>5}s  Score: {:>2}  GPU{}  {detail}  Address: {}{flag}",
-            hit.score,
+            "  Time: {seconds:>5}s  {what}  GPU{}  {detail}  Address: {}{flag}",
             hit.device_index,
             to_checksum_address(&hit.address),
         );
+        let _ = std::io::stdout().flush();
+    }
+
+    /// A round that found more than it could keep says so, rather than looking
+    /// like one where matches happened to be rare.
+    fn on_dropped(&mut self, count: u32, device_index: usize) {
+        self.dropped += u64::from(count);
+        print!("{CLEAR_LINE}");
+        println!("         (+{count} more this round on GPU{device_index}, not kept)");
         let _ = std::io::stdout().flush();
     }
 

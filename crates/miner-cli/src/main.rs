@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use miner_backend::{Backend, Job, Tuning};
+use miner_backend::{Backend, EXACT_CAPACITY, Job, Tuning};
 use miner_core::{Address, Hash, MineMode, ModeConfig, ProfanityConfig, Salt, SaltConfig};
 use rand::RngCore;
 
@@ -111,7 +111,12 @@ fn mine(
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let tuning = common.tuning();
-    let exact_score = scoring.exact_score;
+    let (labels, masks): (Vec<String>, Vec<_>) = scoring
+        .exact
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .unzip();
     let job = Job {
         mode: mode.clone(),
         score: scoring.spec,
@@ -119,20 +124,22 @@ fn mine(
         tuning: tuning.clone(),
         duration: common.seconds.map(Duration::from_secs),
         verify: !common.no_verify,
-        exact_score,
+        exact: scoring.exact.map(|_| masks),
     };
 
     let mut backend = open_backend(common, &mode, &tuning)?;
     print_devices(backend.as_ref(), common, &mode, args);
-    if let Some(needed) = exact_score {
+    if !labels.is_empty() {
+        let plural = if labels.len() == 1 { "mask" } else { "masks" };
         println!(
-            "Exact: reporting every address matching all {needed} constrained byte(s); \
-             the score will not climb."
+            "Exact: reporting every address matching {} {plural} in full, \
+             up to {EXACT_CAPACITY} per round per device.",
+            labels.len()
         );
         println!();
     }
 
-    let mut reporter = TerminalReporter::new(mode.mode(), false);
+    let mut reporter = TerminalReporter::new(mode.mode(), false, labels);
     let should_stop = move || stop.load(Ordering::SeqCst);
     backend.run(&job, &mut reporter, &should_stop)?;
 

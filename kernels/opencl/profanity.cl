@@ -744,18 +744,25 @@ static inline int profanity_score_fn_benchmark(const uint * const address, __con
 	return sum == 0;
 }
 
-// Reports every hash that matches the given mask (data1) and pattern (data2)
-// exactly, unlike the scoring kernels which report at most one hash per score.
-// It has no score to hand back, so it cannot go through PROFANITY_SCORE_KERNEL,
-// but it takes the same arguments so that the host can set them without caring
-// which kernel the mode selected. scoreMax is unused.
+// --exact: every address matching one of the masks in full, appended in arrival
+// order rather than kept one per score.
 //
-// pResult[0].found counts the matches found by this launch; matches are
-// appended at pResult[1..PROFANITY_MAX_SCORE] in arrival order. The host reads
-// the buffer and resets the counter to zero before every launch, so the bounds
-// check below also guarantees that no two work items ever write the same slot.
-// Matches beyond the buffer capacity are counted but not stored; the host
-// reports how many were dropped.
+// A different question from the scoring kernels and so a different buffer.
+// There is no score and no bar, which is why this cannot go through
+// PROFANITY_SCORE_KERNEL; scoreMax is unused and kept only so the host can bind
+// the same arguments whichever kernel a mode selected.
+//
+// pResult[0].found counts this round's matches, which are stored at
+// pResult[1..PROFANITY_EXACT_CAPACITY]. The host clears the counter before each
+// round, so the bounds check below is also what guarantees no two work items
+// claim the same slot. Matches past the capacity are counted but not stored,
+// and the host reports how many. Which mask matched goes in the slot's own
+// `found`, unused in this layout because only slot 0 counts.
+//
+// Comparison is byte-wise through profanity_byte, like every scorer in this
+// file. An earlier draft compared whole words by casting the mask to uint*,
+// which is only equivalent on a little-endian device with 4-byte-aligned
+// argument buffers — an assumption nothing else here makes.
 __kernel void profanity_iterate_exact_match(
 		__global mp_number * const pDeltaX,
 		__global const mp_number * const pInverse,
@@ -763,30 +770,40 @@ __kernel void profanity_iterate_exact_match(
 		__global result * const pResult,
 		__constant const uchar * const data1,
 		__constant const uchar * const data2,
-		const uchar scoreMax,
+		const uint patternCount,
 		const uchar bContract) {
 	const size_t id = get_global_id(0);
 	uint address[5];
 	profanity_iterate(pDeltaX, pInverse, pPrevLambda, id, bContract, address);
 
-	__constant const uint * const mask = (__constant const uint *)data1;
-	__constant const uint * const want = (__constant const uint *)data2;
+	for (uint p = 0; p < patternCount; ++p) {
+		__constant const uchar * const mask = data1 + p * 20;
+		__constant const uchar * const want = data2 + p * 20;
 
-	for (int i = 0; i < 5; ++i) {
-		// Wildcard positions have zero mask bits in data1 and zero bits in
-		// data2, so they compare equal for any hash byte.
-		if ((address[i] & mask[i]) != want[i]) {
-			return;
-		}
-	}
-
-	const uint matchIndex = atomic_inc(&pResult[0].found);
-	if (matchIndex < PROFANITY_MAX_SCORE) {
-		pResult[matchIndex + 1].foundId = id;
-
+		bool matched = true;
 		for (int i = 0; i < 20; ++i) {
-			pResult[matchIndex + 1].foundHash[i] = profanity_byte(address, i);
+			// A wildcard has a zero mask byte and a zero want byte, so it
+			// compares equal whatever the address holds there.
+			if ((profanity_byte(address, i) & mask[i]) != want[i]) {
+				matched = false;
+				break;
+			}
 		}
+		if (!matched) {
+			continue;
+		}
+
+		const uint slot = atomic_inc(&pResult[0].found) + 1;
+		if (slot <= PROFANITY_EXACT_CAPACITY) {
+			pResult[slot].foundId = id;
+			pResult[slot].found = p + 1;
+
+			for (int i = 0; i < 20; ++i) {
+				pResult[slot].foundHash[i] = profanity_byte(address, i);
+			}
+		}
+		// One address can satisfy two masks; report it once, against the first.
+		return;
 	}
 }
 

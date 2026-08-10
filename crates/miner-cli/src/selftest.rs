@@ -155,7 +155,7 @@ fn planted_target(mode: MineMode, common: &CommonArgs) -> anyhow::Result<bool> {
         // The planted item is reached in round 1; allow a little slack.
         duration: Some(std::time::Duration::from_secs(20)),
         verify: true,
-        exact_score: None,
+        exact: None,
     };
 
     let mut backend = crate::open_backend(common, &job.mode, &tuning)?;
@@ -224,7 +224,7 @@ fn profanity_agreement(contract: bool, common: &CommonArgs) -> anyhow::Result<bo
         tuning: tuning.clone(),
         duration: Some(Duration::from_secs(20)),
         verify: true,
-        exact_score: None,
+        exact: None,
     };
 
     let mut backend = crate::open_backend(common, &job.mode, &tuning)?;

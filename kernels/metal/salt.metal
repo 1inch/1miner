@@ -24,12 +24,22 @@ struct Params {
     uint  round;
     uint  secondHash;  // 1 for create3 and 1nft
     uint  scoreMax;
+    uint  patternCount;   // --exact only
+    uint  exactCapacity;  // --exact only: highest slot salt_iterate_exact fills
 };
 
 struct Result {
     uchar salt[32];
     uchar hash[20];
     uint  found;
+};
+
+/// One --exact mask: `mask` has 0xF nibbles where a digit was given and 0 where
+/// it was a wildcard, `want` the digits, so a candidate matches when
+/// (address[i] & mask[i]) == want[i] across all twenty bytes.
+struct Pattern {
+    uchar mask[20];
+    uchar want[20];
 };
 
 // Scoring functions, matching the ModeFunction enum shared with OpenCL.
@@ -260,12 +270,13 @@ static int score_address(thread const uchar* hash, constant Mode& mode) {
     }
 }
 
-kernel void salt_iterate(
-    device Result* results        [[buffer(0)]],
-    constant Mode& mode           [[buffer(1)]],
-    constant Params& params       [[buffer(2)]],
-    device atomic_uint* foundFlags [[buffer(3)]],
-    uint gid                      [[thread_position_in_grid]])
+/// The salt this work item tries and the address it derives. Shared by both
+/// kernels below so neither can drift in what it hashes.
+static void salt_derive(
+    constant Params& params,
+    uint gid,
+    thread uchar* salt,
+    thread uchar* address)
 {
     ulong state[25];
     for (int i = 0; i < 25; ++i) {
@@ -274,14 +285,12 @@ kernel void salt_iterate(
     apply_work_item(state, params.deviceIndex, gid, params.round);
 
     // Keep the salt before the permutation destroys the state.
-    uchar salt[32];
     for (uint i = 0; i < 32; ++i) {
         salt[i] = byte_at(state, i + 21);
     }
 
     keccakf(state);
 
-    uchar address[20];
     for (uint i = 0; i < 20; ++i) {
         address[i] = byte_at(state, i + 12);
     }
@@ -303,6 +312,18 @@ kernel void salt_iterate(
             address[i] = byte_at(second, i + 12);
         }
     }
+}
+
+kernel void salt_iterate(
+    device Result* results        [[buffer(0)]],
+    constant Mode& mode           [[buffer(1)]],
+    constant Params& params       [[buffer(2)]],
+    device atomic_uint* foundFlags [[buffer(3)]],
+    uint gid                      [[thread_position_in_grid]])
+{
+    uchar salt[32];
+    uchar address[20];
+    salt_derive(params, gid, salt, address);
 
     int score = score_address(address, mode);
     if (score <= 0 || (uint)score <= params.scoreMax) {
@@ -320,4 +341,54 @@ kernel void salt_iterate(
         results[score].hash[i] = address[i];
     }
     results[score].found = 1;
+}
+
+/// --exact: every address matching one of the masks in full, appended in
+/// arrival order rather than kept one per score.
+///
+/// A different question from salt_iterate and so a different buffer. There is
+/// no score and no bar: a candidate either matches completely or is not a
+/// result, and all of them are wanted, which one slot per score cannot express.
+///
+/// foundFlags[0] counts this round's matches and results[1..exactCapacity] hold
+/// them. The host clears the counter before each round, so the bounds check is
+/// also what keeps two threads out of one slot. Matches past the capacity are
+/// counted but not stored, and the host reports how many. Which mask matched
+/// goes in the slot's own `found`, unused here since only slot 0 counts.
+kernel void salt_iterate_exact(
+    device Result* results         [[buffer(0)]],
+    constant Pattern* patterns     [[buffer(1)]],
+    constant Params& params        [[buffer(2)]],
+    device atomic_uint* foundFlags [[buffer(3)]],
+    uint gid                       [[thread_position_in_grid]])
+{
+    uchar salt[32];
+    uchar address[20];
+    salt_derive(params, gid, salt, address);
+
+    for (uint p = 0; p < params.patternCount; ++p) {
+        bool matched = true;
+        for (uint i = 0; i < 20; ++i) {
+            if ((address[i] & patterns[p].mask[i]) != patterns[p].want[i]) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) {
+            continue;
+        }
+
+        uint slot = atomic_fetch_add_explicit(&foundFlags[0], 1u, memory_order_relaxed) + 1;
+        if (slot <= params.exactCapacity) {
+            for (uint i = 0; i < 32; ++i) {
+                results[slot].salt[i] = salt[i];
+            }
+            for (uint i = 0; i < 20; ++i) {
+                results[slot].hash[i] = address[i];
+            }
+            results[slot].found = p + 1;
+        }
+        // One address can satisfy two masks; report it once, against the first.
+        return;
+    }
 }

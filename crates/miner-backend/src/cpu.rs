@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use miner_core::{
-    MineMode, ModeConfig, ProfanityConfig, SaltConfig,
-    scoring::score,
+    Address, MineMode, ModeConfig, ProfanityConfig, SaltConfig,
+    scoring::{first_exact_match, score},
     secp256k1::{Point, add_scalars_mod_n, generator, point_add, scalar_mul_generator},
 };
 use rand::RngCore;
@@ -89,7 +89,7 @@ impl CpuBackend {
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<()> {
         let counter = AtomicU64::new(0);
-        let best = AtomicU64::new(job.initial_threshold() as u64);
+        let best = AtomicU64::new(0);
         let hits: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
         let start = Instant::now();
         let mut reported = 0usize;
@@ -121,15 +121,10 @@ impl CpuBackend {
                             let lanes = if paired { 2 } else { 1 };
 
                             for lane in 0..lanes {
-                                let value = score(&job.score, &addresses[lane]) as u64;
-                                if value == 0 || value <= best.load(Ordering::Relaxed) {
+                                let Some((value, pattern)) = examine(job, &addresses[lane], best)
+                                else {
                                     continue;
-                                }
-                                // --exact leaves the bar pinned, so every full
-                                // match is reported rather than only the first.
-                                if !job.is_exact() {
-                                    best.store(value, Ordering::Relaxed);
-                                }
+                                };
                                 let salt = cfg.salt_at(0, pair[lane], round);
                                 let magic = (cfg.mode == MineMode::Nft).then(|| {
                                     let mut m = [0u8; 16];
@@ -137,11 +132,12 @@ impl CpuBackend {
                                     m
                                 });
                                 hits.lock().unwrap().push(Hit {
-                                    score: value as u32,
+                                    score: value,
                                     address: addresses[lane],
                                     salt: Some(salt),
                                     magic,
                                     offset: None,
+                                    pattern,
                                     device_index: 0,
                                     // Derived on the CPU to begin with, so
                                     // there is nothing left to cross-check.
@@ -205,15 +201,11 @@ impl CpuBackend {
             BackendError::Other("the starting offset cancels the seed public key".into())
         })?;
         let mut steps: u64 = 0;
-        let mut best = job.initial_threshold();
+        let best = AtomicU64::new(0);
 
         while !should_stop() && job.duration.is_none_or(|d| start.elapsed() < d) {
             let address = cfg.address_for_point(&point);
-            let value = score(&job.score, &address);
-            if value > best {
-                if !job.is_exact() {
-                    best = value;
-                }
+            if let Some((value, pattern)) = examine(job, &address, &best) {
                 let offset = offset_scalar(&base, steps);
                 // The offset is rebuilt from the base and the step count rather
                 // than read off the walk, so the two can drift; re-deriving the
@@ -229,6 +221,7 @@ impl CpuBackend {
                     salt: None,
                     magic: None,
                     offset: Some(offset),
+                    pattern,
                     device_index: 0,
                     verified,
                 });
@@ -262,6 +255,29 @@ impl CpuBackend {
 /// for. Cryptographic quality is not needed — the security of the result rests
 /// on the user's seed key, which never enters this process — but `rand::rng()`
 /// is OS-seeded, unlike a clock read.
+/// Is this address worth reporting, and if so with what score and which mask?
+///
+/// The two questions the backends ask, in one place because the CPU asks both
+/// of them in two loops. `--exact` wants every address satisfying a mask and
+/// has no bar; scoring wants each improvement on the best seen anywhere, and
+/// raises the bar as it goes.
+fn examine(job: &Job, address: &Address, best: &AtomicU64) -> Option<(u32, Option<usize>)> {
+    match job.exact.as_deref() {
+        Some(masks) => {
+            let pattern = first_exact_match(masks, address)?;
+            Some((masks[pattern].constrained_bytes(), Some(pattern)))
+        }
+        None => {
+            let value = score(&job.score, address) as u64;
+            if value == 0 || value <= best.load(Ordering::Relaxed) {
+                return None;
+            }
+            best.store(value, Ordering::Relaxed);
+            Some((value as u32, None))
+        }
+    }
+}
+
 fn random_base() -> [u8; 32] {
     let mut base = [0u8; 32];
     rand::rng().fill_bytes(&mut base);

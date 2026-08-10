@@ -10,10 +10,12 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use miner_backend::{Backend, Hit, Job, KeccakVariant, Reporter, Tuning, cpu::CpuBackend};
+use miner_backend::{
+    Backend, EXACT_CAPACITY, Hit, Job, KeccakVariant, Reporter, Tuning, cpu::CpuBackend,
+};
 use miner_core::{
     DEFAULT_PROXY_CODE_HASH, MineMode, ModeConfig, ProfanityConfig, SaltConfig, ScoreSpec,
     keccak256, nft_salt, parse_address, secp256k1::generator,
@@ -22,6 +24,11 @@ use miner_core::{
 #[derive(Default)]
 struct Collector {
     hits: Mutex<Vec<Hit>>,
+    /// Candidates tried over the whole run, from the closing summary. Divided
+    /// by the round size this is the number of rounds, which is what bounds
+    /// how many hits a one-slot-per-score buffer could have reported.
+    hashes: AtomicU64,
+    dropped: AtomicU64,
 }
 
 impl Reporter for &Collector {
@@ -29,6 +36,12 @@ impl Reporter for &Collector {
         self.hits.lock().unwrap().push(hit.clone());
     }
     fn on_speed(&mut self, _total: f64, _per_device: &[f64]) {}
+    fn on_summary(&mut self, summary: &miner_backend::speed::SpeedSummary) {
+        self.hashes.store(summary.hashes, Ordering::Relaxed);
+    }
+    fn on_dropped(&mut self, count: u32, _device_index: usize) {
+        self.dropped.fetch_add(u64::from(count), Ordering::Relaxed);
+    }
 }
 
 /// Run a backend until it reports a score of `stop_at` or the job's duration
@@ -102,7 +115,7 @@ fn planted_target(mut backend: Box<dyn Backend>, mode: MineMode, round_size: usi
         },
         duration: Some(Duration::from_secs(30)),
         verify: true,
-        exact_score: None,
+        exact: None,
     };
 
     let hits = run_until(&mut *backend, &job, 20);
@@ -158,14 +171,22 @@ fn cpu_nft_hit_carries_a_usable_magic() {
     assert_eq!(&hit.salt.unwrap()[16..], &keccak256(&caller)[16..32]);
 }
 
-/// `--exact` must keep reporting full matches instead of climbing to a best
-/// score, and every reported address must satisfy the whole mask.
-fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize) {
+/// `--exact` must report every full match, and every reported address must
+/// satisfy the whole mask.
+///
+/// The count is the assertion that matters. One constrained nibble matches
+/// about one candidate in sixteen, so a round of `round_size` produces roughly
+/// `round_size / 16` matches and the run produces that many times the number of
+/// rounds. The one-slot-per-score layout could only ever return one per round,
+/// so requiring far more than the rounds could have produced is what separates
+/// the append path from it — and a test asserting only that matches keep
+/// arriving passed against either.
+fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize, capped: bool) {
     let cfg = config(MineMode::Create2);
-    // One constrained nibble is frequent enough to hit many times quickly.
     let spec = ScoreSpec::matching("a").unwrap();
     let needed = spec.constrained_bytes();
 
+    let seconds = 3;
     let job = Job {
         mode: ModeConfig::Salt(cfg),
         score: spec,
@@ -176,12 +197,11 @@ fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize) {
             no_cache: true,
             ..Tuning::default()
         },
-        duration: Some(Duration::from_secs(3)),
+        duration: Some(Duration::from_secs(seconds)),
         verify: true,
-        exact_score: Some(needed),
+        exact: Some(vec![spec]),
     };
     assert!(job.is_exact());
-    assert_eq!(job.initial_threshold(), needed - 1);
 
     let collector = Collector::default();
     let stop = || false;
@@ -190,15 +210,47 @@ fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize) {
         .expect("run failed");
 
     let hits = collector.hits.lock().unwrap();
+    let hashes = collector.hashes.load(Ordering::Relaxed);
     assert!(
-        hits.len() > 1,
-        "exact mode should report every match, got {}",
-        hits.len()
+        hashes > 0,
+        "no closing summary, so there is nothing to compare the hit count against"
     );
+    let rounds = (hashes / round_size as u64).max(1);
+    // One constrained nibble matches about one candidate in sixteen, and a GPU
+    // round hands back at most a bufferful of them.
+    let expected = round_size as u64 / 16;
+    let per_round = if capped {
+        expected.min(EXACT_CAPACITY as u64)
+    } else {
+        expected
+    };
+    // Half the expected yield leaves room for the last round being cut short
+    // and for the summary excluding a warmup, while still sitting far above the
+    // one per round the scoring layout could manage.
+    let floor = (rounds * per_round / 2).max(2);
+    assert!(
+        hits.len() as u64 >= floor,
+        "exact mode should report every match in a round rather than one: got {} over {rounds} \
+         rounds, where one per round would be {rounds} and this round size implies about \
+         {per_round}",
+        hits.len(),
+    );
+
+    // A round that finds more than it can keep has to say so, rather than
+    // looking like one where matches were simply rarer than they were.
+    if capped && expected > EXACT_CAPACITY as u64 {
+        assert!(
+            collector.dropped.load(Ordering::Relaxed) > 0,
+            "a round of {round_size} yields about {expected} matches against a capacity of \
+             {EXACT_CAPACITY}, so the overflow should have been reported"
+        );
+    }
+
     for hit in hits.iter() {
         // Never a partial match, and never a climbing score.
         assert_eq!(hit.score, needed, "exact mode reported a partial match");
         assert!(hit.verified, "exact mode hit failed CPU re-derivation");
+        assert_eq!(hit.pattern, Some(0), "one mask means every hit matched it");
         // The mask constrains the high nibble of byte 0 to 0xa.
         assert_eq!(hit.address[0] >> 4, 0xa);
     }
@@ -206,7 +258,63 @@ fn exact_matches(mut backend: Box<dyn Backend>, round_size: usize) {
 
 #[test]
 fn exact_mode_reports_repeated_full_matches() {
-    exact_matches(Box::new(CpuBackend::new(Some(2))), 1 << 12);
+    exact_matches(Box::new(CpuBackend::new(Some(2))), 1 << 12, false);
+}
+
+/// Several masks in one pass, which the scoring layout cannot express at all:
+/// it carries one mask and indexes results by score. Each hit has to name the
+/// mask it matched, and each has to actually satisfy that mask.
+fn exact_matches_several_masks(mut backend: Box<dyn Backend>, round_size: usize) {
+    let cfg = config(MineMode::Create2);
+    // Disjoint, so which mask matched is decided by the address rather than by
+    // the order the kernel happens to test them in.
+    let masks = vec![
+        ScoreSpec::matching("a").unwrap(),
+        ScoreSpec::matching("b").unwrap(),
+        ScoreSpec::matching("c").unwrap(),
+    ];
+
+    let job = Job {
+        mode: ModeConfig::Salt(cfg),
+        score: masks[0],
+        keccak: KeccakVariant::Tuned,
+        tuning: Tuning {
+            round_size,
+            work_size: 64,
+            no_cache: true,
+            ..Tuning::default()
+        },
+        duration: Some(Duration::from_secs(3)),
+        verify: true,
+        exact: Some(masks.clone()),
+    };
+
+    let collector = Collector::default();
+    let stop = || false;
+    backend
+        .run(&job, &mut &collector, &stop)
+        .expect("run failed");
+
+    let hits = collector.hits.lock().unwrap();
+    assert!(!hits.is_empty(), "no hits in three seconds");
+
+    let mut seen = [false; 3];
+    for hit in hits.iter() {
+        let pattern = hit.pattern.expect("an exact hit names the mask it matched");
+        assert!(hit.verified);
+        assert_eq!(
+            hit.address[0] >> 4,
+            0xa + pattern as u8,
+            "hit reported against a mask it does not match"
+        );
+        seen[pattern] = true;
+    }
+    assert_eq!(seen, [true; 3], "every mask should have matched something");
+}
+
+#[test]
+fn exact_mode_searches_several_masks_at_once() {
+    exact_matches_several_masks(Box::new(CpuBackend::new(Some(2))), 1 << 12);
 }
 
 /// The generator as the seed public key: its private half is 1, so a failing
@@ -226,7 +334,7 @@ fn profanity_job(cfg: ProfanityConfig, score: ScoreSpec, seconds: u64) -> Job {
         tuning: Tuning::default(),
         duration: Some(Duration::from_secs(seconds)),
         verify: true,
-        exact_score: None,
+        exact: None,
     }
 }
 
@@ -325,6 +433,104 @@ fn cpu_profanity_offsets_re_derive_to_the_address_reported() {
     }
 }
 
+/// `--exact` in profanity, where the mask is checked against an address the
+/// kernel derives through secp256k1 rather than keccak alone, and the result is
+/// an offset rather than a salt.
+///
+/// The OpenCL kernel behind this had never been executed before: it was in the
+/// source, compiled on every run, and never selected. Its comparison is the
+/// part to distrust, so what is asserted is that every address reported really
+/// does satisfy the mask it was reported against, and re-derives from its own
+/// offset.
+///
+/// `digits` sets how rare a match is, because every hit costs a full scalar
+/// multiplication to verify. One nibble means one candidate in sixteen, which a
+/// GPU produces faster than the host can re-derive them.
+fn profanity_exact_matches(backend: &mut dyn Backend, seconds: u64, digits: usize) {
+    let cfg = profanity_config(false);
+    let masks = vec![
+        ScoreSpec::matching(&"a".repeat(digits)).unwrap(),
+        ScoreSpec::matching(&"b".repeat(digits)).unwrap(),
+    ];
+    let job = Job {
+        mode: ModeConfig::Profanity(cfg.clone()),
+        score: masks[0],
+        keccak: KeccakVariant::Tuned,
+        tuning: Tuning {
+            inverse_size: 255,
+            inverse_multiple: 64,
+            work_size: 64,
+            no_cache: true,
+            ..Tuning::default()
+        },
+        duration: Some(Duration::from_secs(seconds)),
+        verify: true,
+        exact: Some(masks),
+    };
+
+    // Both masks matching is the assertion that catches a kernel testing only
+    // the first, so the run ends as soon as both have rather than burning the
+    // timeout. Each hit costs a scalar multiplication to verify, which is what
+    // makes a fixed duration an unreliable way to collect enough of them.
+    struct UntilBothMasks<'a> {
+        inner: &'a Collector,
+        seen: &'a AtomicU64,
+    }
+    impl Reporter for UntilBothMasks<'_> {
+        fn on_hit(&mut self, hit: &Hit) {
+            if let Some(pattern) = hit.pattern {
+                self.seen.fetch_or(1 << pattern, Ordering::SeqCst);
+            }
+            (&mut &*self.inner).on_hit(hit);
+        }
+        fn on_speed(&mut self, _total: f64, _per_device: &[f64]) {}
+    }
+
+    let collector = Collector::default();
+    let seen = AtomicU64::new(0);
+    let stop = || seen.load(Ordering::SeqCst) == 0b11;
+    backend
+        .run(
+            &job,
+            &mut UntilBothMasks {
+                inner: &collector,
+                seen: &seen,
+            },
+            &stop,
+        )
+        .expect("run failed");
+
+    let hits = collector.hits.lock().unwrap();
+    assert!(!hits.is_empty(), "no hits, so nothing here was checked");
+
+    for hit in hits.iter() {
+        let pattern = hit.pattern.expect("an exact hit names the mask it matched");
+        assert_eq!(
+            hit.address[0] >> 4,
+            0xa + pattern as u8,
+            "hit reported against a mask it does not match"
+        );
+        let offset = hit.offset.expect("a profanity hit carries an offset");
+        assert_eq!(
+            cfg.address_for_offset(&offset),
+            Some(hit.address),
+            "the offset names a different address"
+        );
+        assert!(hit.verified);
+    }
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        0b11,
+        "only one of the two masks ever matched in {seconds}s, so nothing here shows that the \
+         second one is tested at all"
+    );
+}
+
+#[test]
+fn cpu_profanity_exact_matches_every_mask() {
+    profanity_exact_matches(&mut CpuBackend::new(Some(2)), 30, 1);
+}
+
 /// Without `--exact` the bar climbs, so each reported score is strictly better
 /// than the one before it.
 #[test]
@@ -342,7 +548,7 @@ fn ordinary_scoring_reports_only_improvements() {
         },
         duration: Some(Duration::from_secs(2)),
         verify: true,
-        exact_score: None,
+        exact: None,
     };
 
     let collector = Collector::default();
@@ -497,7 +703,23 @@ mod opencl {
     #[test]
     fn opencl_exact_mode_reports_untorn_full_matches() {
         let Some(b) = backend() else { return };
-        exact_matches(b, 1 << 16);
+        exact_matches(b, 1 << 16, true);
+    }
+
+    #[test]
+    fn opencl_exact_mode_searches_several_masks_at_once() {
+        let Some(b) = backend() else { return };
+        exact_matches_several_masks(b, 1 << 16);
+    }
+
+    /// The exact kernel in profanity.cl, which until now was compiled on every
+    /// run and never selected, so nothing had ever executed it.
+    #[test]
+    fn opencl_profanity_exact_matches_every_mask() {
+        let Some(mut b) = profanity_backend() else {
+            return;
+        };
+        profanity_exact_matches(&mut b, 30, 3);
     }
 
     /// A round size that `--work` does not divide leaves a chunk no local size
@@ -519,7 +741,7 @@ mod opencl {
             },
             duration: Some(Duration::from_secs(2)),
             verify: true,
-            exact_score: None,
+            exact: None,
         };
 
         let collector = Collector::default();
@@ -554,7 +776,7 @@ mod opencl {
                 },
                 duration: Some(Duration::from_secs(30)),
                 verify: true,
-                exact_score: None,
+                exact: None,
             };
 
             let hits = run_until(&mut b, &job, 20);
@@ -575,18 +797,33 @@ mod metal {
     use super::*;
     use miner_backend::metal::MetalBackend;
 
+    fn backend() -> Option<Box<dyn Backend>> {
+        match MetalBackend::new() {
+            Ok(b) => Some(Box::new(b)),
+            Err(e) => {
+                eprintln!("skipping Metal test: {e}");
+                None
+            }
+        }
+    }
+
     #[test]
     fn metal_agrees_with_the_cpu_in_every_salt_mode() {
         for mode in [MineMode::Create2, MineMode::Create3, MineMode::Nft] {
-            match MetalBackend::new() {
-                Ok(b) => {
-                    planted_target(Box::new(b), mode, 1 << 16);
-                }
-                Err(e) => {
-                    eprintln!("skipping Metal test: {e}");
-                    return;
-                }
-            }
+            let Some(b) = backend() else { return };
+            planted_target(b, mode, 1 << 16);
         }
+    }
+
+    #[test]
+    fn metal_exact_mode_reports_every_match_in_the_round() {
+        let Some(b) = backend() else { return };
+        exact_matches(b, 1 << 16, true);
+    }
+
+    #[test]
+    fn metal_exact_mode_searches_several_masks_at_once() {
+        let Some(b) = backend() else { return };
+        exact_matches_several_masks(b, 1 << 16);
     }
 }

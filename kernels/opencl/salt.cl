@@ -31,6 +31,14 @@ typedef struct __attribute__((packed)) {
 	uint found;
 } result;
 
+/* One --exact mask. `mask` has 0xF nibbles where a digit was given and 0 where
+ * it was a wildcard, `want` the digits themselves, so a candidate matches when
+ * (address[i] & mask[i]) == want[i] for all twenty bytes. */
+typedef struct __attribute__((packed)) {
+	uchar mask[20];
+	uchar want[20];
+} pattern;
+
 void salt_result_update(const uchar * const hash, __global result * const pResult, const uchar score, const uchar scoreMax, const uint deviceIndex, const uint round);
 void salt_score_benchmark(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
 void salt_score_zerobytes(const uchar * const hash, __global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round);
@@ -53,28 +61,45 @@ void salt_score_doubles(const uchar * const hash, __global result * const pResul
 	h.d[7] += get_global_id(0);          \
 	h.d[8] += round;
 
-__kernel void salt_iterate(__global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
-	ethhash h = { .q = { SALT_INITHASH } };
-	SALT_APPLY_WORK_ITEM(h)
-
-	// CREATE2: keccak(0xff ++ deployer ++ salt ++ codeHash), address at h.b[12:32].
-	sha3_keccakf(&h);
-
 #ifdef SALT_SECOND_HASH
-	// CREATE3 second step: the CREATE2 result is a proxy which deploys at
-	// nonce 1, so hash RLP([proxy, 1]) = 0xd6 0x94 ++ proxy ++ 0x01.
-	ethhash h2 = { 0 };
-	h2.b[0] = 0xd6;
-	h2.b[1] = 0x94;
-	for (int i = 0; i < 20; i++) {
-		h2.b[2 + i] = h.b[12 + i];
-	}
-	h2.b[22] = 0x01;
-	// Leading keccak pad bit for a 23-byte message; sha3_keccakf adds the 0x80.
-	h2.b[23] ^= 0x01;
-	sha3_keccakf(&h2);
-	h = h2;
+/* CREATE3 second step: the CREATE2 result is a proxy which deploys at nonce 1,
+ * so hash RLP([proxy, 1]) = 0xd6 0x94 ++ proxy ++ 0x01.
+ *
+ * The temporary has a fixed name rather than one pasted from the argument:
+ * `h##2.b` pastes `h` onto `2.b`, which lexes as a floating-point constant and
+ * is not a valid token to form. */
+#define SALT_APPLY_SECOND_HASH(h)             \
+	ethhash hSecond = { 0 };                  \
+	hSecond.b[0] = 0xd6;                      \
+	hSecond.b[1] = 0x94;                      \
+	for (int i = 0; i < 20; i++) {            \
+		hSecond.b[2 + i] = h.b[12 + i];       \
+	}                                         \
+	hSecond.b[22] = 0x01;                     \
+	/* Leading pad bit for 23 bytes; sha3_keccakf adds the 0x80. */ \
+	hSecond.b[23] ^= 0x01;                    \
+	sha3_keccakf(&hSecond);                   \
+	h = hSecond;
+#else
+#define SALT_APPLY_SECOND_HASH(h)
 #endif
+
+/* The whole derivation for this work item, leaving the address at h.b[12:32].
+ *
+ * A macro rather than a function so that the scoring kernel below generates
+ * exactly what it did before this was shared: a function would either copy the
+ * twenty address bytes out or return a pointer into a local, and the scorers
+ * read straight out of the state. The exact kernel uses the same text, so the
+ * two cannot drift in what they hash. */
+#define SALT_DERIVE(h)                                                    \
+	/* CREATE2: keccak(0xff ++ deployer ++ salt ++ codeHash). */          \
+	ethhash h = { .q = { SALT_INITHASH } };                               \
+	SALT_APPLY_WORK_ITEM(h)                                               \
+	sha3_keccakf(&h);                                                     \
+	SALT_APPLY_SECOND_HASH(h)
+
+__kernel void salt_iterate(__global result * const pResult, __global const mode * const pMode, const uchar scoreMax, const uint deviceIndex, const uint round) {
+	SALT_DERIVE(h)
 
 	switch (pMode->function) {
 	case Benchmark:
@@ -101,6 +126,59 @@ __kernel void salt_iterate(__global result * const pResult, __global const mode 
 	case LeadingRange:
 		salt_score_leadingrange(h.b + 12, pResult, pMode, scoreMax, deviceIndex, round);
 		break;
+	}
+}
+
+/* --exact: every address matching one of the masks in full, appended in arrival
+ * order rather than kept one per score.
+ *
+ * This asks a different question from salt_iterate and so keeps a different
+ * buffer. There is no score and no bar: a candidate either matches a mask
+ * completely or it is not a result at all, and every match is wanted, which the
+ * one-slot-per-score layout cannot express.
+ *
+ * pResult[0].found counts the matches this round found; they are stored at
+ * pResult[1..SALT_EXACT_CAPACITY]. The host clears the counter before each
+ * round and drains what it finds, so the bounds check below is also what
+ * guarantees no two work items claim the same slot. Matches past the capacity
+ * are counted but not stored, and the host reports how many.
+ *
+ * A match records which mask it matched in its own `found` field, which is
+ * unused in this layout because only slot 0 counts. */
+__kernel void salt_iterate_exact(__global result * const pResult, __global const pattern * const pPatterns, const uint patternCount, const uint deviceIndex, const uint round) {
+	SALT_DERIVE(h)
+
+	for (uint p = 0; p < patternCount; ++p) {
+		bool matched = true;
+		for (int i = 0; i < 20; ++i) {
+			if ((h.b[12 + i] & pPatterns[p].mask[i]) != pPatterns[p].want[i]) {
+				matched = false;
+				break;
+			}
+		}
+		if (!matched) {
+			continue;
+		}
+
+		const uint slot = atomic_inc(&pResult[0].found) + 1;
+		if (slot <= SALT_EXACT_CAPACITY) {
+			// Rebuild the state to recover the salt, as the scoring path does,
+			// rather than carrying it through the hash: the host re-derives
+			// every hit, and that only proves something while the two are
+			// separate pieces of arithmetic.
+			ethhash s = { .q = { SALT_INITHASH } };
+			SALT_APPLY_WORK_ITEM(s)
+
+			for (int i = 0; i < 32; ++i) {
+				pResult[slot].salt[i] = s.b[i + 21];
+			}
+			for (int i = 0; i < 20; ++i) {
+				pResult[slot].hash[i] = h.b[12 + i];
+			}
+			pResult[slot].found = p + 1;
+		}
+		// One address can satisfy two masks; report it once, against the first.
+		return;
 	}
 }
 

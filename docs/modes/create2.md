@@ -25,7 +25,7 @@ You need the deployer and the init code, in any of three forms:
 
 `--deployer` is required. It is never assumed, because a salt mined against the wrong deployer produces an address that looks entirely valid and is unusable.
 
-Every scoring mode works here, including `--exact` to keep reporting every address that matches a mask in full rather than climbing towards a best score. See [backends.md](../backends.md) for the tuning flags and [benchmarking.md](../benchmarking.md) for what rate to expect. CREATE2 hashes once per candidate, so it is the fastest of the four modes.
+Every scoring mode works here, including `--exact` to report every address matching a mask in full rather than climbing towards a best score, repeatable to search several masks at once. See [backends.md](../backends.md) for the tuning flags and [benchmarking.md](../benchmarking.md) for what rate to expect. CREATE2 hashes once per candidate, so it is the fastest of the four modes.
 
 Getting the init code hash from Foundry:
 

@@ -34,7 +34,7 @@ cast keccak 0x67363d3d37363d34f03d5260086018f3
 
 A wrong proxy hash silently yields addresses that will never exist, so this is worth one command to check.
 
-Every scoring mode works here, including `--exact` to keep reporting every address that matches a mask in full rather than climbing towards a best score. See [backends.md](../backends.md) for the tuning flags and [benchmarking.md](../benchmarking.md) for what rate to expect.
+Every scoring mode works here, including `--exact` to report every address matching a mask in full rather than climbing towards a best score, repeatable to search several masks at once. See [backends.md](../backends.md) for the tuning flags and [benchmarking.md](../benchmarking.md) for what rate to expect.
 
 ## Checking your setup against a known answer
 
