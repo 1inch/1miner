@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use miner_core::{
-    Address, MineMode, ModeConfig, ProfanityConfig, SaltConfig,
+    Address, ModeConfig, ProfanityConfig, SaltConfig,
     scoring::{first_exact_match, score},
     secp256k1::{Point, add_scalars_mod_n, generator, point_add, scalar_mul_generator},
 };
@@ -126,16 +126,11 @@ impl CpuBackend {
                                     continue;
                                 };
                                 let salt = cfg.salt_at(0, pair[lane], round);
-                                let magic = (cfg.mode == MineMode::Nft).then(|| {
-                                    let mut m = [0u8; 16];
-                                    m.copy_from_slice(&salt[..16]);
-                                    m
-                                });
                                 hits.lock().unwrap().push(Hit {
                                     score: value,
                                     address: addresses[lane],
                                     salt: Some(salt),
-                                    magic,
+                                    magic: cfg.magic_of(&salt),
                                     offset: None,
                                     pattern,
                                     device_index: 0,

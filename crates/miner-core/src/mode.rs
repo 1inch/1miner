@@ -167,15 +167,25 @@ impl SaltConfig {
         self.address_for_salt(&self.salt_at(device_index, global_id, round))
     }
 
-    /// For 1nft the reportable result is the high 16 bytes of the salt.
-    pub fn magic_at(&self, device_index: u32, global_id: u32, round: u32) -> Option<[u8; 16]> {
+    /// For 1nft the reportable result is the high 16 bytes of the salt, which
+    /// is the half the deployer takes; the other salt modes have none.
+    ///
+    /// Every backend reports a hit through here rather than slicing the salt
+    /// itself, because which half is the magic is the same question
+    /// [`nft_salt`](crate::address::nft_salt) answers when it builds one, and
+    /// the two have to agree or a reported magic mints a different address.
+    pub fn magic_of(&self, salt: &Salt) -> Option<[u8; 16]> {
         if self.mode != MineMode::Nft {
             return None;
         }
-        let salt = self.salt_at(device_index, global_id, round);
         let mut magic = [0u8; 16];
         magic.copy_from_slice(&salt[..16]);
         Some(magic)
+    }
+
+    /// The magic a given work item produces.
+    pub fn magic_at(&self, device_index: u32, global_id: u32, round: u32) -> Option<[u8; 16]> {
+        self.magic_of(&self.salt_at(device_index, global_id, round))
     }
 }
 

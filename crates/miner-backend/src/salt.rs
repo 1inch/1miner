@@ -14,7 +14,7 @@
 //! how candidates are enumerated, and the kernels' own derivations stay written
 //! twice on purpose, since that is what the agreement tests compare.
 
-use miner_core::{Address, MineMode, Salt, SaltConfig, ScoreSpec};
+use miner_core::{Address, Salt, SaltConfig, ScoreSpec};
 
 use crate::{EXACT_CAPACITY, Hit, Job, MAX_SCORE, Progress};
 
@@ -39,17 +39,12 @@ impl SaltRound<'_> {
     /// Build the hit a filled result slot describes.
     fn hit_from(&self, slot: &SaltSlot, score: u32, pattern: Option<usize>) -> Hit {
         let salt = slot.salt;
-        let magic = (self.cfg.mode == MineMode::Nft).then(|| {
-            let mut m = [0u8; 16];
-            m.copy_from_slice(&salt[..16]);
-            m
-        });
 
         Hit {
             score,
             address: slot.hash,
             salt: Some(salt),
-            magic,
+            magic: self.cfg.magic_of(&salt),
             offset: None,
             pattern,
             device_index: self.device_index,
@@ -105,7 +100,7 @@ impl SaltRound<'_> {
 
 #[cfg(test)]
 mod tests {
-    use miner_core::{DEFAULT_PROXY_CODE_HASH, ModeConfig, parse_address};
+    use miner_core::{DEFAULT_PROXY_CODE_HASH, MineMode, ModeConfig, parse_address};
 
     use super::*;
     use crate::{KeccakVariant, RESULT_SLOTS, Tuning};
