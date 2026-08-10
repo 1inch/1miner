@@ -21,7 +21,7 @@ use objc2_metal::{
     MTLDevice, MTLResourceOptions, MTLSize,
 };
 
-use super::{MetalBackend, set_bytes, set_slice, threadgroup_width};
+use super::{MetalBackend, read_slots, set_bytes, set_slice, threadgroup_width};
 use crate::profanity::{
     MpNumber, MpPoint, ResultSlot, RoundContext, Ulong4, be_bytes_to_ulong4, check_offset_fields,
     device_seed, precomp_table,
@@ -402,7 +402,10 @@ impl Rounds<'_> {
             round: passes + 1,
         };
 
-        let slots = read_slots(results);
+        // SAFETY: the buffer was allocated with SLOTS entries of this type and
+        // the command buffer that wrote it has completed, which the caller has
+        // waited on.
+        let slots: Vec<ResultSlot> = unsafe { read_slots(results, SLOTS) };
         let found = if self.job.is_exact() {
             // SAFETY: the flag buffer holds SLOTS u32s and slot 0 is the
             // counter; the command buffer that wrote it has completed, so
@@ -479,15 +482,6 @@ fn clear(buffer: &ProtocolObject<dyn MTLBuffer>, bytes: usize) {
     unsafe {
         std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, bytes);
     }
-}
-
-fn read_slots(buffer: &ProtocolObject<dyn MTLBuffer>) -> Vec<ResultSlot> {
-    let base = buffer.contents().as_ptr() as *const ResultSlot;
-    (0..SLOTS)
-        // SAFETY: the buffer was allocated with SLOTS entries of this type and
-        // the GPU work that writes it has completed.
-        .map(|i| unsafe { std::ptr::read_unaligned(base.add(i)) })
-        .collect()
 }
 
 #[cfg(test)]

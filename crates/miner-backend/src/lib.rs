@@ -7,6 +7,7 @@
 pub mod cpu;
 pub mod kernels;
 pub mod profanity;
+pub mod salt;
 pub mod speed;
 
 #[cfg(target_arch = "aarch64")]

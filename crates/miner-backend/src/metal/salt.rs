@@ -6,19 +6,16 @@
 
 use std::time::Instant;
 
-use miner_core::{MineMode, SaltConfig, ScoreSpec};
-use objc2::runtime::ProtocolObject;
+use miner_core::{SaltConfig, ScoreSpec};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLDevice, MTLResourceOptions, MTLSize,
 };
 
-use super::{MetalBackend, set_bytes, set_slice, threadgroup_width};
+use super::{MetalBackend, read_slots, set_bytes, set_slice, threadgroup_width};
+use crate::salt::{SaltRound, SaltSlot};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{
-    BackendError, EXACT_CAPACITY, Hit, Job, MAX_SCORE, Progress, RESULT_SLOTS, Reporter, Result,
-    kernels,
-};
+use crate::{BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels};
 
 const SLOTS: usize = RESULT_SLOTS;
 
@@ -40,14 +37,6 @@ struct MtParams {
     score_max: u32,
     pattern_count: u32,
     exact_capacity: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct MtResult {
-    salt: [u8; 32],
-    hash: [u8; 20],
-    found: u32,
 }
 
 /// One `--exact` mask, matching `Pattern` in kernels/metal/scoring.metal.
@@ -92,7 +81,7 @@ impl MetalBackend {
 
         let results = device
             .newBufferWithLength_options(
-                SLOTS * size_of::<MtResult>(),
+                SLOTS * size_of::<SaltSlot>(),
                 MTLResourceOptions::StorageModeShared,
             )
             .ok_or_else(|| BackendError::Other("failed to allocate result buffer".into()))?;
@@ -114,6 +103,11 @@ impl MetalBackend {
             .collect();
 
         let threadgroup = threadgroup_width(&pipeline, job.tuning.work_size);
+        let reader = SaltRound {
+            cfg,
+            job,
+            device_index: self.infos[0].index,
+        };
 
         let start = Instant::now();
         let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
@@ -140,7 +134,7 @@ impl MetalBackend {
                     std::ptr::write_bytes(
                         results.contents().as_ptr().cast::<u8>(),
                         0,
-                        SLOTS * size_of::<MtResult>(),
+                        SLOTS * size_of::<SaltSlot>(),
                     );
                     std::ptr::write_bytes(flags.contents().as_ptr().cast::<u8>(), 0, SLOTS * 4);
                 }
@@ -198,23 +192,32 @@ impl MetalBackend {
 
             hashes += job.tuning.round_size as u64;
 
-            if job.is_exact() {
+            // SAFETY: the buffer was allocated with SLOTS entries of this type
+            // and the command buffer above has completed, so nothing is still
+            // writing them.
+            let slots: Vec<SaltSlot> = unsafe { read_slots(&results, SLOTS) };
+            let found = if job.is_exact() {
                 // SAFETY: the flag buffer holds SLOTS u32s and slot 0 is the
-                // counter; the command buffer above has completed, so nothing
-                // is still writing either buffer.
+                // counter; as above, nothing is still writing it.
                 let total = unsafe { std::ptr::read_unaligned(flags.contents().as_ptr().cast()) };
-                for found in read_exact(&results, cfg, job, total) {
-                    match found {
-                        Progress::Hit(hit) => reporter.on_hit(&hit),
-                        Progress::Dropped {
-                            count,
-                            device_index,
-                        } => reporter.on_dropped(count, device_index),
+                reader.drain_exact(&slots, total)
+            } else {
+                match reader.take_best(&slots, u64::from(best)) {
+                    Some((score, hit)) => {
+                        best = score;
+                        vec![Progress::Hit(hit)]
                     }
+                    None => Vec::new(),
                 }
-            } else if let Some(hit) = read_best(&results, cfg, job, best) {
-                best = hit.score;
-                reporter.on_hit(&hit);
+            };
+            for progress in found {
+                match progress {
+                    Progress::Hit(hit) => reporter.on_hit(&hit),
+                    Progress::Dropped {
+                        count,
+                        device_index,
+                    } => reporter.on_dropped(count, device_index),
+                }
             }
 
             meter.sample(hashes);
@@ -229,91 +232,6 @@ impl MetalBackend {
     }
 }
 
-/// Build the hit a filled result slot describes, re-deriving the address from
-/// the salt so a kernel that reconstructed the wrong one is caught.
-fn hit_from(
-    entry: &MtResult,
-    score: u32,
-    pattern: Option<usize>,
-    cfg: &SaltConfig,
-    job: &Job,
-) -> Hit {
-    let salt = entry.salt;
-    let address = entry.hash;
-    let magic = (cfg.mode == MineMode::Nft).then(|| {
-        let mut m = [0u8; 16];
-        m.copy_from_slice(&salt[..16]);
-        m
-    });
-
-    Hit {
-        score,
-        address,
-        salt: Some(salt),
-        magic,
-        offset: None,
-        pattern,
-        device_index: 0,
-        verified: !job.verify || cfg.address_for_salt(&salt) == address,
-    }
-}
-
-fn read_best(
-    results: &ProtocolObject<dyn MTLBuffer>,
-    cfg: &SaltConfig,
-    job: &Job,
-    best: u32,
-) -> Option<Hit> {
-    let base = results.contents().as_ptr() as *const MtResult;
-    for score in (1..=MAX_SCORE).rev() {
-        if score as u32 <= best {
-            return None;
-        }
-        // SAFETY: the buffer was allocated with SLOTS entries of this type and
-        // the GPU work that writes it has completed.
-        let entry = unsafe { std::ptr::read_unaligned(base.add(score)) };
-        if entry.found == 0 {
-            continue;
-        }
-        return Some(hit_from(&entry, score as u32, None, cfg, job));
-    }
-    None
-}
-
-/// Slots are the round's matches in arrival order; `total` is how many there
-/// were, including any the buffer had no room for.
-fn read_exact(
-    results: &ProtocolObject<dyn MTLBuffer>,
-    cfg: &SaltConfig,
-    job: &Job,
-    total: u32,
-) -> Vec<Progress> {
-    let base = results.contents().as_ptr() as *const MtResult;
-    let stored = (total as usize).min(EXACT_CAPACITY);
-    let masks = job.exact.as_deref().unwrap_or_default();
-
-    let mut found: Vec<Progress> = (1..=stored)
-        .map(|slot| {
-            // SAFETY: the buffer holds SLOTS entries and `stored` is capped at
-            // EXACT_CAPACITY, which is below it; the GPU work has completed.
-            let entry = unsafe { std::ptr::read_unaligned(base.add(slot)) };
-            // `found` names the mask that matched in this layout, one-based so
-            // an untouched slot is distinguishable from mask 0.
-            let pattern = entry.found.saturating_sub(1) as usize;
-            let score = masks.get(pattern).map_or(0, ScoreSpec::constrained_bytes);
-            Progress::Hit(hit_from(&entry, score, Some(pattern), cfg, job))
-        })
-        .collect();
-
-    if let Some(dropped) = total.checked_sub(stored as u32).filter(|d| *d > 0) {
-        found.push(Progress::Dropped {
-            count: dropped,
-            device_index: 0,
-        });
-    }
-    found
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,7 +239,6 @@ mod tests {
     #[test]
     fn struct_layouts_match_the_kernel() {
         assert_eq!(size_of::<MtMode>(), 44);
-        assert_eq!(size_of::<MtResult>(), 56);
         assert_eq!(size_of::<MtPattern>(), 40);
         // 25 lanes plus six 32-bit fields.
         assert_eq!(size_of::<MtParams>(), 200 + 24);

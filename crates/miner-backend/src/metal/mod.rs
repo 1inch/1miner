@@ -22,8 +22,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLibrary,
+    MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLLibrary,
 };
 
 use crate::{Backend, BackendError, DeviceInfo, Job, ModeConfig, Reporter, Result, kernels};
@@ -148,6 +148,23 @@ unsafe fn set_slice<T>(
     // SAFETY: as `set_bytes`, with the length covering the whole slice, which
     // outlives the call because Metal copies it into the command buffer.
     unsafe { encoder.setBytes_length_atIndex(ptr, size_of_val(values), index) };
+}
+
+/// Copy a result buffer out as owned slots, so the round can be read without
+/// holding a borrow of shared storage the next round will overwrite.
+///
+/// # Safety
+///
+/// The buffer must hold at least `count` elements of `T`, and the command
+/// buffer that wrote them must have completed.
+unsafe fn read_slots<T: Copy>(buffer: &ProtocolObject<dyn MTLBuffer>, count: usize) -> Vec<T> {
+    let base = buffer.contents().as_ptr().cast::<T>();
+    (0..count)
+        // SAFETY: the caller guarantees the buffer holds `count` elements and
+        // that nothing is still writing them. The read is unaligned because a
+        // slot layout the kernels fix does not promise `T`'s alignment.
+        .map(|i| unsafe { std::ptr::read_unaligned(base.add(i)) })
+        .collect()
 }
 
 #[cfg(test)]
