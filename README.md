@@ -2,12 +2,14 @@
 
 One GPU miner for four kinds of Ethereum vanity address, with swappable compute backends and kernels.
 
-| Mode | What it searches | What you get |
-| --- | --- | --- |
-| `profanity` | private-key offsets from a seed **public** key | an offset to add to your seed private key |
-| `create2` | CREATE2 salts for a deployer and init code | a `bytes32` salt |
-| `create3` | CREATE3 salts for a factory | a `bytes32` salt |
-| `1nft` | 1inch Address NFT magics | a `bytes16` magic for `mint()` / `mintFor()` |
+
+| Mode        | What it searches                               | What you get                                 |
+| ----------- | ---------------------------------------------- | -------------------------------------------- |
+| `profanity` | private-key offsets from a seed **public** key | an offset to add to your seed private key    |
+| `create2`   | CREATE2 salts for a deployer and init code     | a `bytes32` salt                             |
+| `create3`   | CREATE3 salts for a factory                    | a `bytes32` salt                             |
+| `1nft`      | 1inch Address NFT magics                       | a `bytes16` magic for `mint()` / `mintFor()` |
+
 
 Backends are chosen at run time: **OpenCL** by default and the only one that covers every mode, **Metal** on macOS, and a portable **CPU** fallback. CUDA is the intended next addition.
 
@@ -51,14 +53,16 @@ No mode ever assumes a deployer address. A salt mined against the wrong deployer
 
 Measured on an Apple M4 Max (40-core GPU) with `scripts/bench.sh`: 20-second windows after an 8-second warmup, two passes in alternating order.
 
-| Mode | Backend | Speed |
-| --- | --- | --- |
-| create2 | Metal | 724.4 MH/s |
-| create2 | OpenCL | 721.8 MH/s |
-| profanity | OpenCL | 381.6 MH/s |
-| create3 / 1nft | OpenCL | 356.1 MH/s |
-| create3 / 1nft | Metal | 352.2 MH/s |
-| create3 / 1nft | CPU (NEON, 16 threads) | 87.3 MH/s |
+
+| Mode           | Backend                | Speed      |
+| -------------- | ---------------------- | ---------- |
+| create2        | Metal                  | 724.4 MH/s |
+| create2        | OpenCL                 | 721.8 MH/s |
+| profanity      | OpenCL                 | 381.6 MH/s |
+| create3 / 1nft | OpenCL                 | 356.1 MH/s |
+| create3 / 1nft | Metal                  | 352.2 MH/s |
+| create3 / 1nft | CPU (NEON, 16 threads) | 87.3 MH/s  |
+
 
 CREATE3 runs at about half of CREATE2 because it hashes twice: CREATE2 for the proxy, then CREATE for the contract. Rates are not comparable across modes for that reason. See [docs/benchmarking.md](docs/benchmarking.md).
 
@@ -81,6 +85,8 @@ Kernels are embedded in the binary, so the image needs no files beside it. For r
 - Building: [Linux](docs/build/linux.md), [macOS](docs/build/macos.md), [Windows](docs/build/windows.md)
 - [Docker](docs/docker.md), [vast.ai](docs/vastai.md)
 - [Correctness](docs/correctness.md), [architecture](docs/architecture.md), [troubleshooting](docs/troubleshooting.md)
+
+
 
 ## Credits
 
