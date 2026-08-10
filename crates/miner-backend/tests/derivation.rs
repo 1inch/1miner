@@ -17,7 +17,7 @@ use miner_backend::{
     Backend, EXACT_CAPACITY, Hit, Job, KeccakVariant, Reporter, Tuning, cpu::CpuBackend,
 };
 use miner_core::{
-    DEFAULT_PROXY_CODE_HASH, MineMode, ModeConfig, ProfanityConfig, SaltConfig, ScoreSpec,
+    DEFAULT_PROXY_CODE_HASH, MineMode, ModeConfig, ProfanityConfig, SaltConfig, ScoreFn, ScoreSpec,
     keccak256, nft_salt, parse_address, secp256k1::generator,
 };
 
@@ -614,6 +614,86 @@ fn ordinary_scoring_reports_only_improvements() {
     }
 }
 
+/// Every scoring function a kernel implements, scored on the device and scored
+/// again on the CPU.
+///
+/// The planted-target tests pin one of the eight, `matching`, and `--zeros`
+/// pins a second. The rest were reachable only by mining with the flag that
+/// selects them, which is this project's usual failure shape: a wrong branch
+/// still returns a plausible number, the address it prefers is real, and the
+/// run simply keeps the wrong candidates.
+///
+/// `Benchmark` is absent because it scores nothing by construction, so it can
+/// report no hit to check. Everything else has to be here, which the coverage
+/// assertion at the end is what enforces.
+fn every_scorer_agrees_with_the_cpu(open: impl Fn() -> Box<dyn Backend>, label: &str) {
+    let specs = [
+        ScoreSpec::zero_bytes(),
+        ScoreSpec::matching("dead").unwrap(),
+        ScoreSpec::trailing("beef").unwrap(),
+        ScoreSpec::leading('7').unwrap(),
+        ScoreSpec::zeros(),
+        ScoreSpec::range(3, 9).unwrap(),
+        ScoreSpec::letters(),
+        ScoreSpec::numbers(),
+        ScoreSpec::mirror(),
+        ScoreSpec::doubles(),
+        ScoreSpec::leading_range(0, 7).unwrap(),
+    ];
+
+    for spec in specs {
+        let job = Job {
+            mode: ModeConfig::Salt(config(MineMode::Create2)),
+            score: spec,
+            keccak: KeccakVariant::Tuned,
+            tuning: Tuning {
+                round_size: 1 << 16,
+                work_size: 64,
+                no_cache: true,
+                ..Tuning::default()
+            },
+            duration: Some(Duration::from_secs(1)),
+            verify: true,
+            exact: None,
+        };
+
+        let hits = run_until(&mut *open(), &job, u32::MAX);
+        assert!(
+            !hits.is_empty(),
+            "{label} {:?}: no hits in a second, so nothing was compared",
+            spec.function
+        );
+        for hit in hits {
+            assert_eq!(
+                hit.score,
+                miner_core::scoring::score(&spec, &hit.address),
+                "{label} {:?}: the device scored {} where the CPU scores {} for {}",
+                spec.function,
+                hit.score,
+                miner_core::scoring::score(&spec, &hit.address),
+                hex::encode(hit.address)
+            );
+            assert!(hit.verified, "{label} {:?}: unverified hit", spec.function);
+        }
+    }
+
+    let covered: Vec<_> = specs.iter().map(|spec| spec.function).collect();
+    for function in [
+        ScoreFn::ZeroBytes,
+        ScoreFn::Matching,
+        ScoreFn::Leading,
+        ScoreFn::Range,
+        ScoreFn::Mirror,
+        ScoreFn::Doubles,
+        ScoreFn::LeadingRange,
+    ] {
+        assert!(
+            covered.contains(&function),
+            "{function:?} has no spec above, so this test says nothing about it"
+        );
+    }
+}
+
 #[cfg(feature = "opencl")]
 mod opencl {
     use super::*;
@@ -710,6 +790,17 @@ mod opencl {
     /// where a truncated first-writer check lets two of them interleave their
     /// writes, so the salt in the slot belongs to one and the address to
     /// another and re-derivation disagrees.
+    #[test]
+    fn opencl_scores_every_function_as_the_cpu_does() {
+        if backend().is_none() {
+            return;
+        }
+        every_scorer_agrees_with_the_cpu(
+            || backend().expect("a device was present a moment ago"),
+            "opencl",
+        );
+    }
+
     #[test]
     fn opencl_exact_mode_reports_untorn_full_matches() {
         let Some(b) = backend() else { return };
@@ -823,6 +914,17 @@ mod metal {
             let Some(b) = backend() else { return };
             planted_target(b, mode, 1 << 16);
         }
+    }
+
+    #[test]
+    fn metal_scores_every_function_as_the_cpu_does() {
+        if backend().is_none() {
+            return;
+        }
+        every_scorer_agrees_with_the_cpu(
+            || backend().expect("a device was present a moment ago"),
+            "metal",
+        );
     }
 
     #[test]
