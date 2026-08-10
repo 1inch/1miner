@@ -8,9 +8,8 @@
 //! Three large scratch buffers hold the batched-inversion state, sized
 //! `inverse_size * inverse_multiple` elements of 32 bytes each.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use miner_core::{ModeConfig, ProfanityConfig, ScoreFn};
 use opencl3::command_queue::CommandQueue;
@@ -20,12 +19,11 @@ use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
 
-use super::{DeviceId, build_program, cl_err, enumerate_devices};
+use super::{DeviceId, DeviceRun, build_program, cl_err, enumerate_devices, run_devices};
 use crate::profanity::{
     MpNumber, MpPoint, ResultSlot, RoundContext, be_bytes_to_ulong4, check_offset_fields,
     device_seed, precomp_table,
 };
-use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
     Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
     RESULT_SLOTS, Reporter, Result, kernels,
@@ -113,82 +111,27 @@ fn run_profanity(
     // Shared by every device and identical for all of them.
     let precomp = precomp_table();
 
-    let counters: Vec<AtomicU64> = ids.iter().map(|_| AtomicU64::new(0)).collect();
-    let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
-    // The exact path has no bar and leaves this at zero.
-    let best_score = AtomicU64::new(0);
-    let failure: Mutex<Option<BackendError>> = Mutex::new(None);
-    let start = Instant::now();
-    let mut reported = 0usize;
-    let mut meters: Vec<SpeedMeter> = ids
-        .iter()
-        .map(|_| SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup))
-        .collect();
-
-    std::thread::scope(|scope| {
-        for (slot, (device_id, info)) in ids.iter().zip(infos).enumerate() {
-            let (source, options, precomp) = (&source, &options, &precomp);
-            let (counters, hits, best_score, failure) = (&counters, &hits, &best_score, &failure);
-
-            scope.spawn(move || {
-                let outcome = run_device(
-                    *device_id,
-                    info,
-                    cfg,
-                    job,
-                    source,
-                    options,
-                    precomp,
-                    &counters[slot],
-                    hits,
-                    best_score,
-                    should_stop,
-                    start,
-                );
-                if let Err(e) = outcome {
-                    let mut guard = failure.lock().unwrap();
-                    if guard.is_none() {
-                        *guard = Some(e);
-                    }
-                }
-            });
-        }
-
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            reported = drain_hits(&hits, reported, reporter);
-
-            for (meter, counter) in meters.iter_mut().zip(counters.iter()) {
-                meter.sample(counter.load(Ordering::Relaxed));
-            }
-            let per_device: Vec<f64> = meters.iter().map(SpeedMeter::rate).collect();
-            reporter.on_speed(per_device.iter().sum(), &per_device);
-
-            let expired = job.duration.is_some_and(|d| start.elapsed() >= d);
-            if expired || should_stop() || failure.lock().unwrap().is_some() {
-                break;
-            }
-        }
-    });
-
-    drain_hits(&hits, reported, reporter);
-    let summaries: Vec<_> = meters.iter().map(SpeedMeter::summary).collect();
-    if let Some(total) = combine(&summaries) {
-        reporter.on_summary(&total);
-    }
-
-    match failure.into_inner().unwrap() {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
-    let guard = hits.lock().unwrap();
-    for found in guard.iter().skip(from) {
-        found.report(reporter);
-    }
-    guard.len()
+    run_devices(
+        ids,
+        infos,
+        job,
+        reporter,
+        should_stop,
+        |device_id, info, run, start| {
+            run_device(
+                device_id,
+                info,
+                cfg,
+                job,
+                &source,
+                &options,
+                &precomp,
+                run,
+                should_stop,
+                start,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,9 +143,7 @@ fn run_device(
     source: &str,
     options: &str,
     precomp: &[MpPoint],
-    counter: &AtomicU64,
-    hits: &Mutex<Vec<Progress>>,
-    best_score: &AtomicU64,
+    run: DeviceRun<'_>,
     should_stop: &(dyn Fn() -> bool + Sync),
     start: Instant,
 ) -> Result<()> {
@@ -428,7 +369,7 @@ fn run_device(
         read_event.wait().map_err(cl_err("result read failed"))?;
 
         round += 1;
-        counter.fetch_add(size as u64, Ordering::Relaxed);
+        run.counter.fetch_add(size as u64, Ordering::Relaxed);
 
         let context = RoundContext {
             cfg,
@@ -442,13 +383,13 @@ fn run_device(
             // no room for.
             context.drain_exact(&results, results[0].found)
         } else {
-            let threshold = best_score.load(Ordering::Relaxed);
+            let threshold = run.best_score.load(Ordering::Relaxed);
             // Every device's progress, not just this one's, so a device that is
             // behind stops writing results the host reads and throws away.
             local_best = threshold as cl_uchar;
             match context.take_best(&results, threshold) {
                 Some((score, hit)) => {
-                    best_score.store(u64::from(score), Ordering::Relaxed);
+                    run.best_score.store(u64::from(score), Ordering::Relaxed);
                     local_best = score as cl_uchar;
                     vec![Progress::Hit(hit)]
                 }
@@ -456,7 +397,7 @@ fn run_device(
             }
         };
         if !found.is_empty() {
-            hits.lock().unwrap().extend(found);
+            run.hits.lock().unwrap().extend(found);
         }
     }
 

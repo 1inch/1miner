@@ -4,13 +4,20 @@ pub mod profanity;
 pub mod salt;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use opencl3::context::Context;
 use opencl3::device::{CL_DEVICE_TYPE_GPU, Device, get_all_devices};
 use opencl3::program::Program;
 use opencl3::types::cl_device_id;
 
-use crate::{BackendError, DeviceInfo, Result};
+use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
+use crate::{BackendError, DeviceInfo, Job, Progress, Reporter, Result};
+
+/// How often the dispatcher looks at what the device threads have produced.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) fn cl_err<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> BackendError + '_ {
     move |e| BackendError::OpenCl(format!("{context}: {e:?}"))
@@ -124,6 +131,105 @@ pub fn build_program(
     }
 
     Ok(program)
+}
+
+/// What one device thread reports into.
+///
+/// A device cannot reach the reporter itself — several run at once and the
+/// reporter is not shared — so findings queue up here and the dispatcher's poll
+/// loop drains them.
+pub struct DeviceRun<'a> {
+    /// Hashes this device has tried, read by the speed meter.
+    pub counter: &'a AtomicU64,
+    pub hits: &'a Mutex<Vec<Progress>>,
+    /// The best score any device has reached, shared so a strong hit on one GPU
+    /// raises the bar on all of them. The exact path has no bar and leaves this
+    /// at zero.
+    pub best_score: &'a AtomicU64,
+}
+
+/// One thread per GPU, each with its own context and queue, polled for progress
+/// until the job's duration elapses or `should_stop` returns true.
+///
+/// Both modes enumerate candidates differently but are dispatched identically,
+/// so `device` is the only part either one writes: it runs one GPU until the
+/// job ends, and whichever error surfaces first is the one the run reports.
+fn run_devices(
+    ids: &[DeviceId],
+    infos: &[DeviceInfo],
+    job: &Job,
+    reporter: &mut dyn Reporter,
+    should_stop: &(dyn Fn() -> bool + Sync),
+    device: impl Fn(DeviceId, &DeviceInfo, DeviceRun<'_>, Instant) -> Result<()> + Sync,
+) -> Result<()> {
+    let counters: Vec<AtomicU64> = ids.iter().map(|_| AtomicU64::new(0)).collect();
+    let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
+    let best_score = AtomicU64::new(0);
+    let failure: Mutex<Option<BackendError>> = Mutex::new(None);
+    let start = Instant::now();
+    let mut reported = 0usize;
+    let mut meters: Vec<SpeedMeter> = ids
+        .iter()
+        .map(|_| SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup))
+        .collect();
+
+    std::thread::scope(|scope| {
+        for (slot, (device_id, info)) in ids.iter().zip(infos).enumerate() {
+            let (counters, hits, best_score) = (&counters, &hits, &best_score);
+            let (failure, device) = (&failure, &device);
+
+            scope.spawn(move || {
+                let run = DeviceRun {
+                    counter: &counters[slot],
+                    hits,
+                    best_score,
+                };
+                if let Err(e) = device(*device_id, info, run, start) {
+                    let mut guard = failure.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(e);
+                    }
+                }
+            });
+        }
+
+        // Poll for progress while the device threads work.
+        loop {
+            std::thread::sleep(POLL_INTERVAL);
+            reported = drain_hits(&hits, reported, reporter);
+
+            for (meter, counter) in meters.iter_mut().zip(counters.iter()) {
+                meter.sample(counter.load(Ordering::Relaxed));
+            }
+            let per_device: Vec<f64> = meters.iter().map(SpeedMeter::rate).collect();
+            reporter.on_speed(per_device.iter().sum(), &per_device);
+
+            let expired = job.duration.is_some_and(|d| start.elapsed() >= d);
+            if expired || should_stop() || failure.lock().unwrap().is_some() {
+                break;
+            }
+        }
+    });
+
+    // Anything found between the last poll and shutdown.
+    drain_hits(&hits, reported, reporter);
+    let summaries: Vec<_> = meters.iter().map(SpeedMeter::summary).collect();
+    if let Some(total) = combine(&summaries) {
+        reporter.on_summary(&total);
+    }
+
+    match failure.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
+    let guard = hits.lock().unwrap();
+    for found in guard.iter().skip(from) {
+        found.report(reporter);
+    }
+    guard.len()
 }
 
 /// Format the 200-byte keccak state as the comma-separated ulong initialiser

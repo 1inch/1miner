@@ -5,9 +5,8 @@
 //! without blocking, queue the next round behind that read, and wait only on
 //! the read. The queue is in-order, so a kernel is always in flight.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use miner_core::{ModeConfig, SaltConfig};
 use opencl3::command_queue::CommandQueue;
@@ -17,9 +16,10 @@ use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_uchar, cl_uint};
 
-use super::{DeviceId, build_program, cl_err, enumerate_devices, state_define};
+use super::{
+    DeviceId, DeviceRun, build_program, cl_err, enumerate_devices, run_devices, state_define,
+};
 use crate::salt::{SaltRound, SaltSlot};
-use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
     Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
     RESULT_SLOTS, Reporter, Result, kernels, wire,
@@ -97,84 +97,26 @@ fn run_salt(
     let source = program_source(job.keccak);
     let options = build_options(cfg);
 
-    let counters: Vec<AtomicU64> = ids.iter().map(|_| AtomicU64::new(0)).collect();
-    let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
-    // Shared so a strong hit on one GPU raises the bar on all of them. The
-    // exact path has no bar and leaves this at zero.
-    let best_score = AtomicU64::new(0);
-    let failure: Mutex<Option<BackendError>> = Mutex::new(None);
-    let start = Instant::now();
-    let mut reported = 0usize;
-    let mut meters: Vec<SpeedMeter> = ids
-        .iter()
-        .map(|_| SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup))
-        .collect();
-
-    std::thread::scope(|scope| {
-        for (slot, (device_id, info)) in ids.iter().zip(infos).enumerate() {
-            let (source, options, counters) = (&source, &options, &counters);
-            let (hits, best_score, failure) = (&hits, &best_score, &failure);
-
-            scope.spawn(move || {
-                let outcome = run_device(
-                    *device_id,
-                    info,
-                    cfg,
-                    job,
-                    source,
-                    options,
-                    &counters[slot],
-                    hits,
-                    best_score,
-                    should_stop,
-                    start,
-                );
-                if let Err(e) = outcome {
-                    let mut guard = failure.lock().unwrap();
-                    if guard.is_none() {
-                        *guard = Some(e);
-                    }
-                }
-            });
-        }
-
-        // Poll for progress while the device threads work.
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            reported = drain_hits(&hits, reported, reporter);
-
-            for (meter, counter) in meters.iter_mut().zip(counters.iter()) {
-                meter.sample(counter.load(Ordering::Relaxed));
-            }
-            let per_device: Vec<f64> = meters.iter().map(SpeedMeter::rate).collect();
-            reporter.on_speed(per_device.iter().sum(), &per_device);
-
-            let expired = job.duration.is_some_and(|d| start.elapsed() >= d);
-            if expired || should_stop() || failure.lock().unwrap().is_some() {
-                break;
-            }
-        }
-    });
-
-    // Anything found between the last poll and shutdown.
-    drain_hits(&hits, reported, reporter);
-    let summaries: Vec<_> = meters.iter().map(SpeedMeter::summary).collect();
-    if let Some(total) = combine(&summaries) {
-        reporter.on_summary(&total);
-    }
-
-    match failure.into_inner().unwrap() {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
-    let guard = hits.lock().unwrap();
-    for found in guard.iter().skip(from) {
-        found.report(reporter);
-    }
-    guard.len()
+    run_devices(
+        ids,
+        infos,
+        job,
+        reporter,
+        should_stop,
+        |device_id, info, run, start| {
+            run_device(
+                device_id,
+                info,
+                cfg,
+                job,
+                &source,
+                &options,
+                run,
+                should_stop,
+                start,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,9 +127,7 @@ fn run_device(
     job: &Job,
     source: &str,
     options: &str,
-    counter: &AtomicU64,
-    hits: &Mutex<Vec<Progress>>,
-    best_score: &AtomicU64,
+    run: DeviceRun<'_>,
     should_stop: &(dyn Fn() -> bool + Sync),
     start: Instant,
 ) -> Result<()> {
@@ -327,31 +267,31 @@ fn run_device(
         queue.flush().map_err(cl_err("flush failed"))?;
         read_event.wait().map_err(cl_err("result read failed"))?;
 
-        counter.fetch_add(round_size as u64, Ordering::Relaxed);
+        run.counter.fetch_add(round_size as u64, Ordering::Relaxed);
 
         let found = if job.is_exact() {
             // Slot 0 counts this round's matches, including any the buffer had
             // no room for.
             reader.drain_exact(&results, results[0].found)
         } else {
-            let threshold = best_score.load(Ordering::Relaxed);
+            let threshold = run.best_score.load(Ordering::Relaxed);
             match reader.take_best(&results, threshold) {
                 Some((score, hit)) => {
-                    best_score.store(u64::from(score), Ordering::Relaxed);
+                    run.best_score.store(u64::from(score), Ordering::Relaxed);
                     vec![Progress::Hit(hit)]
                 }
                 None => Vec::new(),
             }
         };
         if !found.is_empty() {
-            hits.lock().unwrap().extend(found);
+            run.hits.lock().unwrap().extend(found);
         }
         // After the drain rather than before, because reporting publishes the
         // score: one load then raises this kernel's bar to the best any device
         // has found, instead of leaving a device that is behind writing results
         // the host reads and throws away. In --exact mode the shared value is
         // pinned, so this is a no-op.
-        local_best = best_score.load(Ordering::Relaxed) as cl_uchar;
+        local_best = run.best_score.load(Ordering::Relaxed) as cl_uchar;
     }
 
     queue.finish().map_err(cl_err("finish failed"))?;
