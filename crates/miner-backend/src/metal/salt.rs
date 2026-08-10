@@ -7,17 +7,15 @@
 use std::time::Instant;
 
 use miner_core::SaltConfig;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLDevice, MTLResourceOptions, MTLSize,
-};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
-use super::{MetalBackend, read_slots, set_bytes, set_slice, threadgroup_width};
+use super::{
+    MetalBackend, clear, dispatch, encode, read_counter, read_slots, set_bytes, set_slice,
+    threadgroup_width,
+};
 use crate::salt::{SaltRound, SaltSlot};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{
-    BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels, wire,
-};
+use crate::{EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels, wire};
 
 const SLOTS: usize = RESULT_SLOTS;
 
@@ -41,10 +39,7 @@ impl MetalBackend {
         reporter: &mut dyn Reporter,
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<()> {
-        let device = &self.device;
-        let queue = device
-            .newCommandQueue()
-            .ok_or_else(|| BackendError::Other("failed to create a Metal command queue".into()))?;
+        let queue = self.command_queue()?;
 
         let library = self.build_library(kernels::METAL_SALT)?;
         // --exact asks a different question and so runs a different kernel over
@@ -56,15 +51,8 @@ impl MetalBackend {
         };
         let pipeline = self.pipeline(&library, kernel_name)?;
 
-        let results = device
-            .newBufferWithLength_options(
-                SLOTS * size_of::<SaltSlot>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| BackendError::Other("failed to allocate result buffer".into()))?;
-        let flags = device
-            .newBufferWithLength_options(SLOTS * 4, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| BackendError::Other("failed to allocate flag buffer".into()))?;
+        let results = self.shared_buffer(SLOTS * size_of::<SaltSlot>(), "result")?;
+        let flags = self.shared_buffer(SLOTS * 4, "flag")?;
 
         let mode = wire::Mode::from(&job.score);
         let patterns = wire::patterns(job.exact.as_deref());
@@ -90,21 +78,12 @@ impl MetalBackend {
 
             // The exact kernel appends from the counter in foundFlags[0], so
             // clearing both buffers each round is the protocol rather than a
-            // workaround: it is what lets the next round start at slot 1.
+            // workaround: it is what lets the next round start at slot 1. The
+            // previous round was waited on at the end of the loop body, so no
+            // GPU work is in flight.
             if job.is_exact() {
-                // SAFETY: both pointers come from `contents()` on a
-                // StorageModeShared buffer, and the lengths are exactly the ones
-                // the buffers were allocated with above. The previous round was
-                // waited on at the end of the loop body, so no GPU work is in
-                // flight and nothing else holds a reference to the storage.
-                unsafe {
-                    std::ptr::write_bytes(
-                        results.contents().as_ptr().cast::<u8>(),
-                        0,
-                        SLOTS * size_of::<SaltSlot>(),
-                    );
-                    std::ptr::write_bytes(flags.contents().as_ptr().cast::<u8>(), 0, SLOTS * 4);
-                }
+                clear(&results);
+                clear(&flags);
             }
 
             let params = MtParams {
@@ -117,13 +96,7 @@ impl MetalBackend {
                 exact_capacity: EXACT_CAPACITY as u32,
             };
 
-            let command_buffer = queue
-                .commandBuffer()
-                .ok_or_else(|| BackendError::Other("failed to create a command buffer".into()))?;
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or_else(|| BackendError::Other("failed to create a compute encoder".into()))?;
-
+            let (command_buffer, encoder) = encode(&queue)?;
             encoder.setComputePipelineState(&pipeline);
             // SAFETY: the indices match `salt_iterate`'s parameter positions in
             // kernels/metal/salt.metal, and both buffers plus `mode` and
@@ -141,18 +114,7 @@ impl MetalBackend {
                 set_bytes(&encoder, &params, 2);
                 encoder.setBuffer_offset_atIndex(Some(&flags), 0, 3);
             }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: job.tuning.round_size,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threadgroup,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            dispatch(&encoder, job.tuning.round_size, threadgroup);
             encoder.endEncoding();
             command_buffer.commit();
             command_buffer.waitUntilCompleted();
@@ -166,7 +128,7 @@ impl MetalBackend {
             let found = if job.is_exact() {
                 // SAFETY: the flag buffer holds SLOTS u32s and slot 0 is the
                 // counter; as above, nothing is still writing it.
-                let total = unsafe { std::ptr::read_unaligned(flags.contents().as_ptr().cast()) };
+                let total = unsafe { read_counter(&flags) };
                 reader.drain_exact(&slots, total)
             } else {
                 match reader.take_best(&slots, u64::from(best)) {

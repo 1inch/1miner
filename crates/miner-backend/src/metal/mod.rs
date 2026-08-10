@@ -22,8 +22,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLLibrary,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
 use crate::{Backend, BackendError, DeviceInfo, Job, ModeConfig, Reporter, Result, kernels};
@@ -75,6 +76,71 @@ impl MetalBackend {
         self.device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| BackendError::Build(format!("pipeline creation failed for {name}: {e:?}")))
+    }
+
+    fn command_queue(&self) -> Result<Retained<ProtocolObject<dyn MTLCommandQueue>>> {
+        self.device
+            .newCommandQueue()
+            .ok_or_else(|| BackendError::Other("failed to create a Metal command queue".into()))
+    }
+
+    /// A buffer the CPU can read, which is what results and their counters have
+    /// to be. The scratch buffers a search works in stay in private storage and
+    /// are allocated where their size can be explained.
+    fn shared_buffer(
+        &self,
+        bytes: usize,
+        what: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| BackendError::Other(format!("failed to allocate the {what} buffer")))
+    }
+}
+
+type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
+
+/// One command buffer with one compute encoder, which is how every dispatch
+/// here is submitted.
+fn encode(queue: &ProtocolObject<dyn MTLCommandQueue>) -> Result<(CommandBuffer, Encoder)> {
+    let command_buffer = queue
+        .commandBuffer()
+        .ok_or_else(|| BackendError::Other("failed to create a command buffer".into()))?;
+    let encoder = command_buffer
+        .computeCommandEncoder()
+        .ok_or_else(|| BackendError::Other("failed to create a compute encoder".into()))?;
+    Ok((command_buffer, encoder))
+}
+
+/// A one-dimensional dispatch, which is the only shape any kernel here wants.
+fn dispatch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, threads: usize, group: usize) {
+    encoder.dispatchThreads_threadsPerThreadgroup(
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Zero a shared buffer in full.
+///
+/// The caller must have waited on any command buffer that uses it: this writes
+/// storage the GPU can be reading, and clearing a buffer a round in flight is
+/// still appending to would lose that round's matches.
+fn clear(buffer: &ProtocolObject<dyn MTLBuffer>) {
+    // SAFETY: the pointer comes from `contents()` on a StorageModeShared
+    // buffer and the length is the one it was allocated with, so the write is
+    // in bounds. No GPU work is in flight, which is the caller's obligation
+    // above.
+    unsafe {
+        std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, buffer.length());
     }
 }
 
@@ -148,6 +214,19 @@ unsafe fn set_slice<T>(
     // SAFETY: as `set_bytes`, with the length covering the whole slice, which
     // outlives the call because Metal copies it into the command buffer.
     unsafe { encoder.setBytes_length_atIndex(ptr, size_of_val(values), index) };
+}
+
+/// The `--exact` match count, which both exact kernels keep in slot 0 of their
+/// flag buffer and which counts past what the result buffer could hold.
+///
+/// # Safety
+///
+/// The buffer must hold at least one `u32`, and the command buffer that wrote
+/// it must have completed.
+unsafe fn read_counter(buffer: &ProtocolObject<dyn MTLBuffer>) -> u32 {
+    // SAFETY: the caller guarantees the buffer holds the counter and that
+    // nothing is still writing it.
+    unsafe { std::ptr::read_unaligned(buffer.contents().as_ptr().cast()) }
 }
 
 /// Copy a result buffer out as owned slots, so the round can be read without

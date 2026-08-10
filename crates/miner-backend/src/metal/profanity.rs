@@ -14,14 +14,16 @@
 use std::time::Instant;
 
 use miner_core::ProfanityConfig;
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLDevice, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDevice,
+    MTLResourceOptions,
 };
 
-use super::{MetalBackend, read_slots, set_bytes, set_slice, threadgroup_width};
+use super::{
+    CommandBuffer, MetalBackend, clear, dispatch, encode, read_counter, read_slots, set_bytes,
+    set_slice, threadgroup_width,
+};
 use crate::profanity::{
     MpNumber, MpPoint, ResultSlot, RoundContext, Ulong4, be_bytes_to_ulong4, check_offset_fields,
     device_seed, precomp_table,
@@ -73,9 +75,7 @@ impl MetalBackend {
         check_offset_fields(size, &self.infos)?;
 
         let device = &self.device;
-        let queue = device
-            .newCommandQueue()
-            .ok_or_else(|| BackendError::Other("failed to create a Metal command queue".into()))?;
+        let queue = self.command_queue()?;
 
         let library = self.build_library(kernels::METAL_PROFANITY)?;
         let init = self.pipeline(&library, "profanity_init")?;
@@ -113,12 +113,7 @@ impl MetalBackend {
         let prev_lambda = scratch("lambda")?;
 
         let precomp = precomp_table();
-        let precomp_buffer = device
-            .newBufferWithLength_options(
-                precomp.len() * size_of::<MpPoint>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| BackendError::Other("failed to allocate the precomp buffer".into()))?;
+        let precomp_buffer = self.shared_buffer(precomp.len() * size_of::<MpPoint>(), "precomp")?;
         // SAFETY: the buffer was allocated with exactly this many bytes and is
         // in shared storage, so its contents pointer is writable by the CPU. No
         // GPU work has been submitted yet.
@@ -135,17 +130,10 @@ impl MetalBackend {
         let mut results = Vec::with_capacity(PIPELINE);
         let mut flags = Vec::with_capacity(PIPELINE);
         for _ in 0..PIPELINE {
-            let r = device
-                .newBufferWithLength_options(
-                    SLOTS * size_of::<ResultSlot>(),
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .ok_or_else(|| BackendError::Other("failed to allocate result buffer".into()))?;
-            let f = device
-                .newBufferWithLength_options(SLOTS * 4, MTLResourceOptions::StorageModeShared)
-                .ok_or_else(|| BackendError::Other("failed to allocate flag buffer".into()))?;
-            clear(&r, SLOTS * size_of::<ResultSlot>());
-            clear(&f, SLOTS * 4);
+            let r = self.shared_buffer(SLOTS * size_of::<ResultSlot>(), "result")?;
+            let f = self.shared_buffer(SLOTS * 4, "flag")?;
+            clear(&r);
+            clear(&f);
             results.push(r);
             flags.push(f);
         }
@@ -185,12 +173,7 @@ impl MetalBackend {
             let run = init_chunk.min(size - initialized);
             params.id_base = initialized as u32;
 
-            let command_buffer = queue
-                .commandBuffer()
-                .ok_or_else(|| BackendError::Other("failed to create a command buffer".into()))?;
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or_else(|| BackendError::Other("failed to create a compute encoder".into()))?;
+            let (command_buffer, encoder) = encode(&queue)?;
             encoder.setComputePipelineState(&init);
             // SAFETY: the indices match `profanity_init`'s parameter positions
             // in kernels/metal/profanity.metal, and every buffer plus `params`
@@ -234,7 +217,7 @@ impl MetalBackend {
         // The rest of the per-round overhead is on the device and stays: the
         // two dispatches are serially dependent, as consecutive rounds are, so
         // nothing here can overlap the launches themselves.
-        let mut in_flight: Option<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64)> = None;
+        let mut in_flight: Option<(CommandBuffer, u64)> = None;
 
         loop {
             if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
@@ -253,20 +236,15 @@ impl MetalBackend {
             // waited on while this one's predecessor was being encoded, so
             // clearing it here cannot race the GPU.
             if job.is_exact() {
-                clear(&results[slot], SLOTS * size_of::<ResultSlot>());
-                clear(&flags[slot], SLOTS * 4);
+                clear(&results[slot]);
+                clear(&flags[slot]);
             }
             // Two rounds behind rather than one, since the round in flight has
             // not been read yet. The bar only suppresses writes the host would
             // discard anyway, so a stale one costs nothing but a few of them.
             params.score_max = best as u32;
 
-            let command_buffer = queue
-                .commandBuffer()
-                .ok_or_else(|| BackendError::Other("failed to create a command buffer".into()))?;
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or_else(|| BackendError::Other("failed to create a compute encoder".into()))?;
+            let (command_buffer, encoder) = encode(&queue)?;
 
             // A compute encoder created this way is serial, so the inverse
             // dispatches below are ordered before the iterate dispatches and
@@ -396,7 +374,7 @@ impl Rounds<'_> {
             // SAFETY: the flag buffer holds SLOTS u32s and slot 0 is the
             // counter; the command buffer that wrote it has completed, so
             // nothing is still writing it.
-            let total = unsafe { std::ptr::read_unaligned(flags.contents().as_ptr().cast()) };
+            let total = unsafe { read_counter(flags) };
             context.drain_exact(&slots, total)
         } else {
             match context.take_best(&slots, *best) {
@@ -420,30 +398,6 @@ fn chunks(total: usize, work_max: usize) -> impl Iterator<Item = (usize, usize)>
     (0..total)
         .step_by(work_max)
         .map(move |offset| (offset, work_max.min(total - offset)))
-}
-
-fn dispatch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, threads: usize, group: usize) {
-    encoder.dispatchThreads_threadsPerThreadgroup(
-        MTLSize {
-            width: threads,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: group,
-            height: 1,
-            depth: 1,
-        },
-    );
-}
-
-fn clear(buffer: &ProtocolObject<dyn MTLBuffer>, bytes: usize) {
-    // SAFETY: the pointer comes from `contents()` on a StorageModeShared
-    // buffer and `bytes` is the length it was allocated with. Every caller has
-    // waited on the previous command buffer, so no GPU work is in flight.
-    unsafe {
-        std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, bytes);
-    }
 }
 
 #[cfg(test)]
