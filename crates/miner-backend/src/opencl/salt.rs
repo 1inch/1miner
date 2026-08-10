@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use miner_core::{ModeConfig, SaltConfig, ScoreSpec};
+use miner_core::{ModeConfig, SaltConfig};
 use opencl3::command_queue::CommandQueue;
 use opencl3::context::Context;
 use opencl3::device::Device;
@@ -22,43 +22,8 @@ use crate::salt::{SaltRound, SaltSlot};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
 use crate::{
     Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
-    RESULT_SLOTS, Reporter, Result, kernels,
+    RESULT_SLOTS, Reporter, Result, kernels, wire,
 };
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ClMode {
-    function: cl_uint,
-    data1: [cl_uchar; 20],
-    data2: [cl_uchar; 20],
-}
-
-impl From<&ScoreSpec> for ClMode {
-    fn from(spec: &ScoreSpec) -> Self {
-        Self {
-            function: spec.function as cl_uint,
-            data1: spec.data1,
-            data2: spec.data2,
-        }
-    }
-}
-
-/// One `--exact` mask, matching `pattern` in kernels/opencl/salt.cl.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct ClPattern {
-    mask: [cl_uchar; 20],
-    want: [cl_uchar; 20],
-}
-
-impl From<&ScoreSpec> for ClPattern {
-    fn from(spec: &ScoreSpec) -> Self {
-        Self {
-            mask: spec.data1,
-            want: spec.data2,
-        }
-    }
-}
 
 /// The scoring mode and the exact masks are different shapes bound to the same
 /// kernel argument, so both reach the device as plain bytes.
@@ -262,18 +227,12 @@ fn run_device(
 
     // One mode for scoring, or the masks for --exact. Both are read-only and
     // uploaded once, so they share a buffer slot in the kernel's arguments.
-    let patterns: Vec<ClPattern> = job
-        .exact
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(ClPattern::from)
-        .collect();
-    let modes = [ClMode::from(&job.score)];
+    let patterns = wire::patterns(job.exact.as_deref());
+    let modes = [wire::Mode::from(&job.score)];
     let (mode_bytes, mode_len) = if job.is_exact() {
-        (bytes_of(&patterns), patterns.len() * size_of::<ClPattern>())
+        (bytes_of(&patterns), size_of_val(patterns.as_slice()))
     } else {
-        (bytes_of(&modes), size_of::<ClMode>())
+        (bytes_of(&modes), size_of::<wire::Mode>())
     };
 
     // SAFETY: as above, OpenCL owns the allocation.

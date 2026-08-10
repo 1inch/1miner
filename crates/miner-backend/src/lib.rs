@@ -9,6 +9,7 @@ pub mod kernels;
 pub mod profanity;
 pub mod salt;
 pub mod speed;
+pub mod wire;
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;

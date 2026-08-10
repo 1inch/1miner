@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use miner_core::{SaltConfig, ScoreSpec};
+use miner_core::SaltConfig;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLDevice, MTLResourceOptions, MTLSize,
@@ -15,17 +15,11 @@ use objc2_metal::{
 use super::{MetalBackend, read_slots, set_bytes, set_slice, threadgroup_width};
 use crate::salt::{SaltRound, SaltSlot};
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels};
+use crate::{
+    BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels, wire,
+};
 
 const SLOTS: usize = RESULT_SLOTS;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MtMode {
-    function: u32,
-    data1: [u8; 20],
-    data2: [u8; 20],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,23 +31,6 @@ struct MtParams {
     score_max: u32,
     pattern_count: u32,
     exact_capacity: u32,
-}
-
-/// One `--exact` mask, matching `Pattern` in kernels/metal/scoring.metal.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MtPattern {
-    mask: [u8; 20],
-    want: [u8; 20],
-}
-
-impl From<&ScoreSpec> for MtPattern {
-    fn from(spec: &ScoreSpec) -> Self {
-        Self {
-            mask: spec.data1,
-            want: spec.data2,
-        }
-    }
 }
 
 impl MetalBackend {
@@ -89,18 +66,8 @@ impl MetalBackend {
             .newBufferWithLength_options(SLOTS * 4, MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| BackendError::Other("failed to allocate flag buffer".into()))?;
 
-        let mode = MtMode {
-            function: job.score.function as u32,
-            data1: job.score.data1,
-            data2: job.score.data2,
-        };
-        let patterns: Vec<MtPattern> = job
-            .exact
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(MtPattern::from)
-            .collect();
+        let mode = wire::Mode::from(&job.score);
+        let patterns = wire::patterns(job.exact.as_deref());
 
         let threadgroup = threadgroup_width(&pipeline, job.tuning.work_size);
         let reader = SaltRound {
@@ -237,9 +204,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn struct_layouts_match_the_kernel() {
-        assert_eq!(size_of::<MtMode>(), 44);
-        assert_eq!(size_of::<MtPattern>(), 40);
+    fn the_params_layout_matches_the_kernel() {
         // 25 lanes plus six 32-bit fields.
         assert_eq!(size_of::<MtParams>(), 200 + 24);
     }

@@ -27,7 +27,9 @@ use crate::profanity::{
     device_seed, precomp_table,
 };
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels};
+use crate::{
+    BackendError, EXACT_CAPACITY, Job, Progress, RESULT_SLOTS, Reporter, Result, kernels, wire,
+};
 
 const SLOTS: usize = RESULT_SLOTS;
 
@@ -57,14 +59,6 @@ struct MtProfParams {
     pattern_count: u32,
     exact_capacity: u32,
     contract: u32,
-}
-
-/// One `--exact` mask, matching `Pattern` in kernels/metal/scoring.metal.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MtPattern {
-    mask: [u8; 20],
-    want: [u8; 20],
 }
 
 impl MetalBackend {
@@ -158,16 +152,8 @@ impl MetalBackend {
 
         let (seed_x, seed_y) = cfg.seed_public_key.to_bytes();
         let seed = device_seed(self.infos[0].index);
-        let patterns: Vec<MtPattern> = job
-            .exact
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|spec| MtPattern {
-                mask: spec.data1,
-                want: spec.data2,
-            })
-            .collect();
+        let mode = wire::Mode::from(&job.score);
+        let patterns = wire::patterns(job.exact.as_deref());
 
         let mut params = MtProfParams {
             seed: seed.0,
@@ -313,7 +299,7 @@ impl MetalBackend {
                     if job.is_exact() {
                         set_slice(&encoder, &patterns, 4);
                     } else {
-                        set_bytes(&encoder, &mode_of(job), 4);
+                        set_bytes(&encoder, &mode, 4);
                     }
                     set_bytes(&encoder, &params, 5);
                     encoder.setBuffer_offset_atIndex(Some(&flags[slot]), 0, 6);
@@ -434,24 +420,6 @@ impl Rounds<'_> {
     }
 }
 
-/// The scoring mode the iterate kernel reads, in the layout scoring.metal
-/// declares. Built per dispatch because `set_bytes` copies it immediately.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MtMode {
-    function: u32,
-    data1: [u8; 20],
-    data2: [u8; 20],
-}
-
-fn mode_of(job: &Job) -> MtMode {
-    MtMode {
-        function: job.score.function as u32,
-        data1: job.score.data1,
-        data2: job.score.data2,
-    }
-}
-
 /// Split a launch into `work_max` sized pieces, as the OpenCL dispatcher does.
 /// Each piece needs its own `id_base`, which is the offset returned here.
 fn chunks(total: usize, work_max: usize) -> impl Iterator<Item = (usize, usize)> {
@@ -489,11 +457,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn struct_layouts_match_the_kernel() {
+    fn the_params_layout_matches_the_kernel() {
         // Three sets of four lanes, then six 32-bit fields.
         assert_eq!(size_of::<MtProfParams>(), 96 + 24);
-        assert_eq!(size_of::<MtPattern>(), 40);
-        assert_eq!(size_of::<MtMode>(), 44);
     }
 
     /// A chunked launch has to cover every work item exactly once, and each
