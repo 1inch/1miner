@@ -21,8 +21,8 @@ use objc2_metal::{
 };
 
 use super::{
-    CommandBuffer, MetalBackend, clear, dispatch, encode, read_counter, read_slots, set_bytes,
-    set_slice, threadgroup_width,
+    CommandBuffer, MetalBackend, PIPELINE, clear, dispatch, encode, read_counter, read_slots,
+    set_bytes, set_slice, threadgroup_width,
 };
 use crate::profanity::{
     MpNumber, MpPoint, ResultSlot, RoundContext, Ulong4, be_bytes_to_ulong4, check_offset_fields,
@@ -34,12 +34,6 @@ use crate::{
 };
 
 const SLOTS: usize = RESULT_SLOTS;
-
-/// Rounds that can be in flight at once, and so result buffers to rotate
-/// through. Two is enough to keep the GPU fed: the rounds are strictly ordered
-/// on the device anyway, and all a third would buy is a longer wait before a
-/// hit is printed.
-const PIPELINE: usize = 2;
 
 /// Matches `ProfParams` in kernels/metal/profanity.metal.
 ///

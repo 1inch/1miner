@@ -29,6 +29,12 @@ use objc2_metal::{
 
 use crate::{Backend, BackendError, DeviceInfo, Job, ModeConfig, Reporter, Result, kernels};
 
+/// Rounds that can be in flight at once, and so result buffers to rotate
+/// through. Two is enough to keep the GPU fed: the rounds are strictly ordered
+/// on the device anyway, and all a third would buy is a longer wait before a
+/// hit is printed.
+const PIPELINE: usize = 2;
+
 /// The prelude every Metal library starts with. `METAL_KECCAK` carries the
 /// `#include` and so has to come first.
 fn library_source(kernel: &str) -> String {
