@@ -14,7 +14,7 @@ use opencl3::program::Program;
 use opencl3::types::cl_device_id;
 
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter, combine};
-use crate::{BackendError, DeviceInfo, Job, Progress, Reporter, Result};
+use crate::{BackendError, DeviceInfo, Job, Progress, Reporter, Result, drain_hits};
 
 /// How often the dispatcher looks at what the device threads have produced.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -204,8 +204,7 @@ fn run_devices(
             let per_device: Vec<f64> = meters.iter().map(SpeedMeter::rate).collect();
             reporter.on_speed(per_device.iter().sum(), &per_device);
 
-            let expired = job.duration.is_some_and(|d| start.elapsed() >= d);
-            if expired || should_stop() || failure.lock().unwrap().is_some() {
+            if job.expired(start) || should_stop() || failure.lock().unwrap().is_some() {
                 break;
             }
         }
@@ -222,14 +221,6 @@ fn run_devices(
         Some(e) => Err(e),
         None => Ok(()),
     }
-}
-
-fn drain_hits(hits: &Mutex<Vec<Progress>>, from: usize, reporter: &mut dyn Reporter) -> usize {
-    let guard = hits.lock().unwrap();
-    for found in guard.iter().skip(from) {
-        found.report(reporter);
-    }
-    guard.len()
 }
 
 /// Format the 200-byte keccak state as the comma-separated ulong initialiser

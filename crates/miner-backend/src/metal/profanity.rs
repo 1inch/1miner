@@ -214,7 +214,7 @@ impl MetalBackend {
         let mut in_flight: Option<(CommandBuffer, u64)> = None;
 
         loop {
-            if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
+            if should_stop() || job.expired(start) {
                 break;
             }
             passes += 1;

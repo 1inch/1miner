@@ -20,7 +20,7 @@ pub mod metal;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use miner_core::{Address, ModeConfig, Salt, ScoreSpec};
 
@@ -149,6 +149,14 @@ impl Job {
     pub fn is_exact(&self) -> bool {
         self.exact.is_some()
     }
+
+    /// Whether the run has reached its deadline, `start` being when it began.
+    ///
+    /// A run with no `--seconds` never expires, and every loop that asks pairs
+    /// this with its own `should_stop`, which is the other way a run ends.
+    pub fn expired(&self, start: Instant) -> bool {
+        self.duration.is_some_and(|d| start.elapsed() >= d)
+    }
 }
 
 /// How many matches one round on one device can hand back in `--exact`.
@@ -222,6 +230,23 @@ impl Progress {
             } => reporter.on_dropped(*count, *device_index),
         }
     }
+}
+
+/// Report everything a queue has gained past `from`, returning the new mark.
+///
+/// The queue is a watermark rather than something emptied: a backend appends
+/// under its own lock and the run loop reports from where it left off, so
+/// nothing is lost if a poll and a hit land at the same moment.
+pub fn drain_hits(
+    queue: &std::sync::Mutex<Vec<Progress>>,
+    from: usize,
+    reporter: &mut dyn Reporter,
+) -> usize {
+    let guard = queue.lock().unwrap();
+    for found in guard.iter().skip(from) {
+        found.report(reporter);
+    }
+    guard.len()
 }
 
 /// Progress callbacks, invoked from the run loop.

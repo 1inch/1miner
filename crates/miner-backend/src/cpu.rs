@@ -17,7 +17,7 @@ use miner_core::{
 use rand::RngCore;
 
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{Backend, BackendError, DeviceInfo, Hit, Job, Reporter, Result};
+use crate::{Backend, BackendError, DeviceInfo, Hit, Job, Progress, Reporter, Result, drain_hits};
 
 pub struct CpuBackend {
     infos: Vec<DeviceInfo>,
@@ -90,7 +90,7 @@ impl CpuBackend {
     ) -> Result<()> {
         let counter = AtomicU64::new(0);
         let best = AtomicU64::new(0);
-        let hits: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
+        let hits: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
         let start = Instant::now();
         let mut reported = 0usize;
 
@@ -101,7 +101,7 @@ impl CpuBackend {
                 scope.spawn(move || {
                     let mut round: u32 = 0;
                     loop {
-                        if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
+                        if should_stop() || job.expired(start) {
                             break;
                         }
                         round = round.wrapping_add(1);
@@ -126,7 +126,7 @@ impl CpuBackend {
                                     continue;
                                 };
                                 let salt = cfg.salt_at(0, pair[lane], round);
-                                hits.lock().unwrap().push(Hit {
+                                hits.lock().unwrap().push(Progress::Hit(Hit {
                                     score: value,
                                     address: addresses[lane],
                                     salt: Some(salt),
@@ -137,16 +137,14 @@ impl CpuBackend {
                                     // Derived on the CPU to begin with, so
                                     // there is nothing left to cross-check.
                                     verified: true,
-                                });
+                                }));
                             }
 
                             done += lanes as u64;
                             gid = gid.wrapping_add(stride * 2);
                             if done % 4096 < lanes as u64 {
                                 counter.fetch_add(4096, Ordering::Relaxed);
-                                if should_stop()
-                                    || job.duration.is_some_and(|d| start.elapsed() >= d)
-                                {
+                                if should_stop() || job.expired(start) {
                                     break;
                                 }
                             }
@@ -159,7 +157,7 @@ impl CpuBackend {
             reported = poll(&hits, reported, &counter, start, job, reporter, should_stop);
         });
 
-        drain(&hits, reported, reporter);
+        drain_hits(&hits, reported, reporter);
         Ok(())
     }
 
@@ -198,7 +196,7 @@ impl CpuBackend {
         let mut steps: u64 = 0;
         let best = AtomicU64::new(0);
 
-        while !should_stop() && job.duration.is_none_or(|d| start.elapsed() < d) {
+        while !should_stop() && !job.expired(start) {
             let address = cfg.address_for_point(&point);
             if let Some((value, pattern)) = examine(job, &address, &best) {
                 let offset = offset_scalar(&base, steps);
@@ -328,7 +326,7 @@ fn derive_pair(cfg: &SaltConfig, gids: [u32; 2], round: u32) -> [miner_core::Add
 
 #[allow(clippy::too_many_arguments)]
 fn poll(
-    hits: &Mutex<Vec<Hit>>,
+    hits: &Mutex<Vec<Progress>>,
     mut reported: usize,
     counter: &AtomicU64,
     start: Instant,
@@ -339,13 +337,13 @@ fn poll(
     let mut meter = SpeedMeter::starting_at(start, DEFAULT_WINDOW, job.tuning.warmup);
     loop {
         std::thread::sleep(Duration::from_millis(250));
-        reported = drain(hits, reported, reporter);
+        reported = drain_hits(hits, reported, reporter);
 
         meter.sample(counter.load(Ordering::Relaxed));
         let rate = meter.rate();
         reporter.on_speed(rate, &[rate]);
 
-        if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
+        if should_stop() || job.expired(start) {
             // The meter lives here, so the summary has to be reported here too.
             if let Some(summary) = meter.summary() {
                 reporter.on_summary(&summary);
@@ -353,12 +351,4 @@ fn poll(
             return reported;
         }
     }
-}
-
-fn drain(hits: &Mutex<Vec<Hit>>, from: usize, reporter: &mut dyn Reporter) -> usize {
-    let guard = hits.lock().unwrap();
-    for hit in guard.iter().skip(from) {
-        reporter.on_hit(hit);
-    }
-    guard.len()
 }

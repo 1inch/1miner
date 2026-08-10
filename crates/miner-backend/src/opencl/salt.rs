@@ -205,7 +205,7 @@ fn run_device(
     let zeros = vec![SaltSlot::default(); RESULT_SLOTS];
 
     loop {
-        if should_stop() || job.duration.is_some_and(|d| start.elapsed() >= d) {
+        if should_stop() || job.expired(start) {
             break;
         }
 
