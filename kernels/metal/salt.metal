@@ -61,6 +61,17 @@ static void salt_derive(
     apply_work_item(state, params.deviceIndex, gid, params.round);
 
     // Keep the salt before the permutation destroys the state.
+    //
+    // The OpenCL kernel instead rebuilds it from SALT_INITHASH on the rare
+    // candidate that is a result, and doing the same here was measured: 348.8
+    // against 354.4 MH/s for create3 on an M4 Max, alternating order, both
+    // pairs agreeing. Carrying 32 bytes through the permutations costs less
+    // than a second 25-lane state in a branch, because Metal budgets registers
+    // for the worst path through the kernel and not for the common one.
+    //
+    // It is also the safer of the two: a salt read out of the state that was
+    // hashed cannot disagree with it, where a reconstruction can, which is why
+    // the OpenCL side has the planted-target tests watching for exactly that.
     for (uint i = 0; i < 32; ++i) {
         salt[i] = byte_at(state, i + 21);
     }
