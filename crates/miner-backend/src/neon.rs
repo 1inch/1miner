@@ -211,6 +211,13 @@ unsafe fn pack(a: &[u64; 25], b: &[u64; 25]) -> [uint64x2_t; 25] {
 
 /// Extract the 20-byte address at bytes 12..32 of each lane's state.
 ///
+/// Expanding all 25 lanes to take twenty bytes out of each looks like 360 bytes
+/// of copying nothing reads, since the address can only come from lanes 1 to 4.
+/// Reading just those four costs 15% — measured, on top of the state change
+/// above — because the state is still live in the permutation's loop and
+/// reaching into part of it is enough to put the whole array on the stack. This
+/// is the same trap the comment on `keccak_f_x2` describes.
+///
 /// # Safety
 ///
 /// Requires NEON, which is part of the aarch64 baseline this module is gated on.
@@ -235,6 +242,15 @@ unsafe fn unpack_addresses(st: &[uint64x2_t; 25]) -> [Address; LANES] {
 }
 
 /// The 200-byte keccak state for one work item, as 25 lanes.
+///
+/// Rebuilding the pre-image per candidate reads like waste, since only three
+/// words differ between work items and the kernels bump exactly those. Building
+/// the base state once per run and patching those words was measured and is
+/// slower: 174 against 156 MH/s on an M4 Max, create2, alternating order with
+/// the change and without, and no better with the helper marked `#[inline]`.
+/// LLVM already lifts everything here that does not depend on the work item out
+/// of the candidate loop, and giving it a prepared state to read from memory
+/// takes that away. Leave it alone.
 fn state_for(cfg: &SaltConfig, device_index: u32, global_id: u32, round: u32) -> [u64; 25] {
     let salt = cfg.salt_at(device_index, global_id, round);
     let mut bytes = cfg.state();
