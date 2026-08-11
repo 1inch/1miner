@@ -685,6 +685,16 @@ static inline void profanity_iterate(__global mp_number * const pDeltaX, __globa
 	h.d[15] = bswap32(tmp.d[MP_WORDS - 8]);
 	h.d[16] ^= 0x01; // length 64
 
+	// sha3_keccakf_address would be valid at both hashes here — nothing reads
+	// this state outside words 3 to 7, and the contract hash below takes only
+	// those same twenty bytes — and it buys nothing. Measured under --contract,
+	// which hashes twice and so is the best case this kernel has: 246.5 against
+	// 246.8 MH/s on an M4 Max, macOS 26.5.2, 2026-08-11, alternating order with
+	// 60-second cooldowns and the two groups interleaved, and 269.9 against
+	// 267.1 on the metal port, which is the wrong way round. The salt kernels
+	// gain from the same change because they have registers to spare for the
+	// pruned round's five temporaries; this one is already full of
+	// multi-precision arithmetic.
 	sha3_keccakf(&h);
 
 	// The address is the low 20 bytes of the hash, words 3 through 7.

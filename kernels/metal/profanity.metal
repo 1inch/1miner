@@ -685,6 +685,10 @@ static void profanity_iterate(
     }
     st[8] ^= 0x01; // length 64: the leading keccak pad bit
 
+    // keccakf_address would be valid at both hashes here, for the reason and
+    // with the measurement kernels/opencl/profanity.cl records: 269.9 against
+    // 267.1 MH/s under --contract on an M4 Max, macOS 26.5.2, 2026-08-11, both
+    // pairs the wrong way round.
     keccakf(st);
 
     // The address is the low 20 bytes of the hash.
