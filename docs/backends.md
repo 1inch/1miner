@@ -26,7 +26,7 @@ On aarch64 the salt modes use a two-lane NEON Keccak, holding each of the 25 Kec
 
 `MINER_NO_NEON=1` forces the plain scalar path. Use it to A/B the two, or as a safety valve if the SIMD path ever misbehaves on some hardware. The test suite asserts both produce identical addresses for every mode, so the choice is a performance one only.
 
-The ARMv8.2 SHA3 extension would be faster still, but its Rust intrinsics are not yet stable, so it is not used.
+Where the ARMv8.2 SHA3 extension is present, which is every Apple silicon chip, the permutation uses it: `eor3` folds three XORs into one, `rax1` does theta's rotate-and-XOR, `xar` does theta's XOR and rho's rotation in one instruction, and `bcax` does chi. Worth 6.7% for create2 on an M4 Max, 176.1 against 165.0 MH/s, measured by switching paths in the same binary. It is detected at run time rather than assumed, since it is not part of the aarch64 baseline, and `MINER_NO_SHA3=1` forces the plain NEON path. The two are asserted to produce identical states for every input the suite tries, so this too is a performance choice only.
 
 ## Kernels
 

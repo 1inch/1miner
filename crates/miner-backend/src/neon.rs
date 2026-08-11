@@ -2,8 +2,8 @@
 //!
 //! Each of the 25 Keccak lanes is held as a `uint64x2_t`, so one permutation
 //! processes two independent candidates. NEON is mandatory on aarch64, so no
-//! runtime detection is needed; the ARMv8.2 SHA3 extension would be faster
-//! still but its intrinsics are not yet stable in Rust.
+//! runtime detection is needed for it; the ARMv8.2 SHA3 extension is not, and
+//! [`keccak_f_x2_sha3`] is used in place of [`keccak_f_x2`] where it is present.
 //!
 //! The permutation follows the same convention as the OpenCL and Metal kernels:
 //! callers set the leading `0x01` pad bit and the permutation applies the
@@ -191,6 +191,136 @@ unsafe fn keccak_f_x2(st: &mut [uint64x2_t; 25]) {
     }
 }
 
+/// Keccak-f[1600] over two states at once, using the ARMv8.2 SHA3 extension.
+///
+/// The same permutation as [`keccak_f_x2`], lane for lane, in the four
+/// instructions that exist for it: `eor3` folds three XORs into one, `rax1` does
+/// theta's rotate-and-XOR, `xar` does theta's XOR and rho's rotation together,
+/// and `bcax` does chi's `a ^ (!b & c)`. That leaves the round body at roughly
+/// a third of the operations.
+///
+/// `xar` is why the rho chain below carries a `d` value per step: the XOR that
+/// the plain version applies to all 25 lanes first is folded into each rotation
+/// instead. Which `d` a lane takes follows its column, exactly as the plain
+/// version's five blocks of five do. `st[0]` is the one lane rho does not
+/// rotate, so it keeps a plain XOR — `xar` cannot express a rotation of zero,
+/// its immediate stopping at 63.
+///
+/// # Safety
+///
+/// Requires the `sha3` target feature, which is not part of the aarch64
+/// baseline. Callers must have checked for it; [`sha3_enabled`] is that check.
+#[target_feature(enable = "sha3")]
+unsafe fn keccak_f_x2_sha3(st: &mut [uint64x2_t; 25]) {
+    /// `rotl(a ^ b, N)`, which `xar` computes as a rotate right by `64 - N`.
+    macro_rules! xar {
+        ($a:expr, $b:expr, $n:literal) => {
+            vxarq_u64::<{ 64 - $n }>($a, $b)
+        };
+    }
+
+    // Every intrinsic here is register-only, so the target features are the
+    // whole obligation and this function's own attribute carries them: inside
+    // it the calls need no unsafe block. Indices are literals bounded by 25.
+    {
+        // Trailing keccak pad byte: byte 135 is the top byte of lane 16.
+        st[16] = veorq_u64(st[16], vdupq_n_u64(0x8000_0000_0000_0000));
+
+        for rc in ROUND_CONSTANTS {
+            // Theta's column parities, two three-way XORs each.
+            let c0 = veor3q_u64(veor3q_u64(st[0], st[5], st[10]), st[15], st[20]);
+            let c1 = veor3q_u64(veor3q_u64(st[1], st[6], st[11]), st[16], st[21]);
+            let c2 = veor3q_u64(veor3q_u64(st[2], st[7], st[12]), st[17], st[22]);
+            let c3 = veor3q_u64(veor3q_u64(st[3], st[8], st[13]), st[18], st[23]);
+            let c4 = veor3q_u64(veor3q_u64(st[4], st[9], st[14]), st[19], st[24]);
+
+            // `rax1(a, b)` is `a ^ rotl(b, 1)`, which is what each of these is.
+            let d4 = vrax1q_u64(c3, c0);
+            let d0 = vrax1q_u64(c0, c2);
+            let d1 = vrax1q_u64(c2, c4);
+            let d2 = vrax1q_u64(c4, c1);
+            let d3 = vrax1q_u64(c1, c3);
+
+            // Rho and pi as the same 24-element rotation chain the plain
+            // version uses, with theta's XOR folded into every step.
+            let t = xar!(st[1], d0, 1);
+            st[1] = xar!(st[6], d0, 44);
+            st[6] = xar!(st[9], d4, 20);
+            st[9] = xar!(st[22], d3, 61);
+            st[22] = xar!(st[14], d4, 39);
+            st[14] = xar!(st[20], d2, 18);
+            st[20] = xar!(st[2], d3, 62);
+            st[2] = xar!(st[12], d3, 43);
+            st[12] = xar!(st[13], d1, 25);
+            st[13] = xar!(st[19], d4, 8);
+            st[19] = xar!(st[23], d1, 56);
+            st[23] = xar!(st[15], d2, 41);
+            st[15] = xar!(st[4], d4, 27);
+            st[4] = xar!(st[24], d4, 14);
+            st[24] = xar!(st[21], d0, 2);
+            st[21] = xar!(st[8], d1, 55);
+            st[8] = xar!(st[16], d0, 45);
+            st[16] = xar!(st[5], d2, 36);
+            st[5] = xar!(st[3], d1, 28);
+            st[3] = xar!(st[18], d1, 21);
+            st[18] = xar!(st[17], d3, 15);
+            st[17] = xar!(st[11], d0, 10);
+            st[11] = xar!(st[7], d3, 6);
+            st[7] = xar!(st[10], d2, 3);
+            st[10] = t;
+            st[0] = veorq_u64(st[0], d2);
+
+            // Chi, one row of five at a time. `bcax(a, c, b)` is `a ^ (c & !b)`.
+            for row in 0..5 {
+                let base = row * 5;
+                let a0 = st[base];
+                let a1 = st[base + 1];
+                st[base] = vbcaxq_u64(a0, st[base + 2], a1);
+                st[base + 1] = vbcaxq_u64(a1, st[base + 3], st[base + 2]);
+                st[base + 2] = vbcaxq_u64(st[base + 2], st[base + 4], st[base + 3]);
+                st[base + 3] = vbcaxq_u64(st[base + 3], a0, st[base + 4]);
+                st[base + 4] = vbcaxq_u64(st[base + 4], a1, a0);
+            }
+
+            // Iota.
+            st[0] = veorq_u64(st[0], vdupq_n_u64(rc));
+        }
+    }
+}
+
+/// Whether the SHA3 extension's permutation is used.
+///
+/// Not part of the aarch64 baseline, unlike NEON, so it is detected rather than
+/// assumed; every Apple silicon chip has it. `MINER_NO_SHA3=1` forces the plain
+/// NEON path, both to A/B the two and as a way to keep mining if the extension
+/// path ever misbehaves on some hardware.
+fn sha3_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("MINER_NO_SHA3").as_deref(),
+            Ok("1") | Ok("true")
+        ) && std::arch::is_aarch64_feature_detected!("sha3")
+    })
+}
+
+/// Whichever permutation this machine can run. Both are checked against each
+/// other in tests, so which one runs stays a performance choice.
+///
+/// # Safety
+///
+/// Requires NEON, which is part of the aarch64 baseline this module is gated on.
+#[inline]
+unsafe fn permute(st: &mut [uint64x2_t; 25]) {
+    if sha3_enabled() {
+        // SAFETY: `sha3_enabled` is true only when the feature was detected.
+        unsafe { keccak_f_x2_sha3(st) }
+    } else {
+        // SAFETY: NEON alone, which aarch64 always has.
+        unsafe { keccak_f_x2(st) }
+    }
+}
+
 /// Pack two scalar states into lane-interleaved vectors.
 ///
 /// # Safety
@@ -296,7 +426,7 @@ pub fn addresses(
     // below refers to a local fixed-size array.
     let first = unsafe {
         let mut st = pack(&a, &b);
-        keccak_f_x2(&mut st);
+        permute(&mut st);
         unpack_addresses(&st)
     };
 
@@ -310,7 +440,7 @@ pub fn addresses(
         let a = create_state_for(&first[0]);
         let b = create_state_for(&first[1]);
         let mut st = pack(&a, &b);
-        keccak_f_x2(&mut st);
+        permute(&mut st);
         unpack_addresses(&st)
     }
 }
@@ -352,6 +482,53 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Both lanes of a packed state, so two permutations can be compared.
+    fn lanes(st: &[uint64x2_t; 25]) -> [[u64; 2]; 25] {
+        let mut out = [[0u64; 2]; 25];
+        for (slot, lane) in out.iter_mut().zip(st) {
+            // SAFETY: the store writes exactly the two `u64` of `slot`.
+            unsafe { vst1q_u64(slot.as_mut_ptr(), *lane) };
+        }
+        out
+    }
+
+    /// The SHA3-extension permutation has to agree with the plain one on every
+    /// lane of every state, since which of the two runs is a property of the
+    /// machine rather than of the search. This is what catches a mistranscribed
+    /// step of the rho chain, where the folded theta XOR makes each line carry
+    /// one more thing to get wrong.
+    #[test]
+    fn the_sha3_permutation_matches_the_plain_one() {
+        if !std::arch::is_aarch64_feature_detected!("sha3") {
+            eprintln!("skipping SHA3 comparison: the extension is absent");
+            return;
+        }
+
+        // Something structured, something sparse and something dense, since a
+        // wrong lane can hide behind a state that is mostly one value.
+        let states: [[u64; 25]; 4] = [
+            [0; 25],
+            std::array::from_fn(|i| i as u64),
+            std::array::from_fn(|i| 0x0123_4567_89ab_cdefu64.wrapping_mul(i as u64 + 1)),
+            std::array::from_fn(|i| !(1u64 << (i % 64))),
+        ];
+
+        for a in &states {
+            for b in &states {
+                // SAFETY: NEON is baseline, and the extension was detected
+                // above; every pointer is to a live local array.
+                let (plain, extended) = unsafe {
+                    let mut p = pack(a, b);
+                    keccak_f_x2(&mut p);
+                    let mut e = pack(a, b);
+                    keccak_f_x2_sha3(&mut e);
+                    (lanes(&p), lanes(&e))
+                };
+                assert_eq!(plain, extended, "permutations disagree");
             }
         }
     }

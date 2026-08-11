@@ -73,6 +73,7 @@ Never quote a hashrate from a single back-to-back run. GPUs throttle, and this p
 | Variable | Effect |
 | --- | --- |
 | `MINER_NO_NEON=1` | Force the scalar CPU keccak instead of the two-lane NEON path. |
+| `MINER_NO_SHA3=1` | Force the plain NEON keccak instead of the ARMv8.2 SHA3 one. |
 | `MINER_ARGS` | Container only: the argument list used when none is given. |
 | `MINER_OUTPUT` | Container only: tee output to a file. |
 | `MINER_SKIP_GPU_CHECK=1` | Container only: silence the "no OpenCL devices" warning. |
