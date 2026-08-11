@@ -4,9 +4,11 @@
  * same program apart from one extra keccak. That difference is a compile-time
  * switch here (SALT_SECOND_HASH) so all three modes share one kernel.
  *
- * Requires a keccak implementation providing `ethhash` and `sha3_keccakf`,
- * prepended by the host. Note that `sha3_keccakf` applies the trailing 0x80
- * keccak pad byte itself; callers supply only the leading 0x01 pad bit.
+ * Requires a keccak implementation providing `ethhash`, `sha3_keccakf` and
+ * `sha3_keccakf_address`, prepended by the host. Note that both apply the
+ * trailing 0x80 keccak pad byte themselves; callers supply only the leading
+ * 0x01 pad bit. Nothing here reads a hash outside bytes 12 to 32, so both
+ * hashes take the address-only permutation.
  *
  * Defines expected from the host:
  *   SALT_INITHASH     25 comma-separated ulongs: the 200-byte keccak state
@@ -66,9 +68,9 @@ typedef struct __attribute__((packed)) {
 		hSecond.b[2 + i] = h.b[12 + i];       \
 	}                                         \
 	hSecond.b[22] = 0x01;                     \
-	/* Leading pad bit for 23 bytes; sha3_keccakf adds the 0x80. */ \
+	/* Leading pad bit for 23 bytes; the permutation adds the 0x80. */ \
 	hSecond.b[23] ^= 0x01;                    \
-	sha3_keccakf(&hSecond);                   \
+	sha3_keccakf_address(&hSecond);           \
 	h = hSecond;
 #else
 #define SALT_APPLY_SECOND_HASH(h)
@@ -85,7 +87,7 @@ typedef struct __attribute__((packed)) {
 	/* CREATE2: keccak(0xff ++ deployer ++ salt ++ codeHash). */          \
 	ethhash h = { .q = { SALT_INITHASH } };                               \
 	SALT_APPLY_WORK_ITEM(h)                                               \
-	sha3_keccakf(&h);                                                     \
+	sha3_keccakf_address(&h);                                             \
 	SALT_APPLY_SECOND_HASH(h)
 
 void salt_result_update(const uchar * const H, __global result * const pResult, const uchar score, const uchar scoreMax, const uint deviceIndex, const uint round) {

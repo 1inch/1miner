@@ -109,16 +109,64 @@ static inline ulong rotl(ulong x, uint n) {
     t0 = s04; t1 = s14; s04 ^= (~t1) & s24; s14 ^= (~s24) & s34; s24 ^= (~s34) & s44; s34 ^= (~s44) & t0; s44 ^= (~t0) & t1; \
 }
 
-static void keccakf(thread ulong* st) {
+/* Every round but the last, and the trailing pad byte, which lives here rather
+ * than in each ending below so that no ending can be written without it. */
+static void keccakf_rounds(thread ulong* st) {
     st[16] ^= 0x8000000000000000UL;
     ulong t0, t1, t2, t3, t4, t5;
 
-    for (int i = 0; i < 24; ++i) {
+    for (int i = 0; i < 23; ++i) {
         THETA(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
         RHOPI(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
         KHI(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
         st[0] ^= kRoundConstants[i];
     }
+}
+
+static void keccakf(thread ulong* st) {
+    keccakf_rounds(st);
+    ulong t0, t1, t2, t3, t4, t5;
+
+    THETA(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
+    RHOPI(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
+    KHI(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
+    st[0] ^= kRoundConstants[23];
+}
+
+/* Keccak-f for a caller that reads bytes 12 to 32 and nothing else, which is
+ * where an Ethereum address comes from. Only lanes 1 to 3 are left correct;
+ * every other lane holds a value from the middle of the last round. Anything
+ * that reads more of the state than those twenty bytes wants keccakf.
+ *
+ * The last round is cut to what those three lanes need. Iota only touches lane
+ * 0, so it goes entirely. Chi produces lanes 1 to 3 from lanes 0 to 4 alone,
+ * and rho/pi builds those five from the diagonal 0, 6, 12, 18, 24, so nineteen
+ * of the twenty-four rotations and twenty-two of the twenty-five chi triples
+ * are dead. Theta stays whole: those five lanes take all five column parities,
+ * and the parities take all 25 lanes.
+ *
+ * Measured on an M4 Max, macOS 26.5.2, 2026-08-11, alternating order with
+ * 60-second cooldowns: create2 730.6 -> 754.1 and create3 357.7 -> 363.1 MH/s,
+ * neither pair overlapping. Half a round in twenty-four is worth about 2% and
+ * the rest is the last round being peeled out of the loop above, which the
+ * profanity kernel gained 1.9% from while still calling the full permutation.
+ */
+static void keccakf_address(thread ulong* st) {
+    keccakf_rounds(st);
+    ulong t0, t1, t2, t3, t4, t5;
+
+    THETA(st[0], st[5], st[10], st[15], st[20], st[1], st[6], st[11], st[16], st[21], st[2], st[7], st[12], st[17], st[22], st[3], st[8], st[13], st[18], st[23], st[4], st[9], st[14], st[19], st[24]);
+
+    // The five lanes RHOPI would leave at 0 to 4, then the three of KHI's
+    // first group that carry bytes 8 to 32.
+    const ulong b0 = st[0];
+    const ulong b1 = rotl(st[6], 44);
+    const ulong b2 = rotl(st[12], 43);
+    const ulong b3 = rotl(st[18], 21);
+    const ulong b4 = rotl(st[24], 14);
+    st[1] = b1 ^ ((~b2) & b3);
+    st[2] = b2 ^ ((~b3) & b4);
+    st[3] = b3 ^ ((~b4) & b0);
 }
 
 static inline uchar byte_at(thread const ulong* state, uint index) {

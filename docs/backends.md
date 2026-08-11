@@ -44,7 +44,7 @@ They are functionally identical, which the test suite asserts by having both fin
 3. Add a variant to `KeccakVariant` in `crates/miner-backend/src/lib.rs`, wiring up `source()`, `as_str()`, `parse()` and `all()`.
 4. Add the name to the `--kernel` value list in `crates/miner-cli/src/cli.rs`.
 
-The interface a Keccak source must provide is small: the `ethhash` union and `void sha3_keccakf(ethhash *)`. Note that `sha3_keccakf` is expected to apply the trailing `0x80` pad byte itself; see [how-address-derivation-works.md](how-address-derivation-works.md).
+The interface a Keccak source must provide is small: the `ethhash` union, `void sha3_keccakf(ethhash *)`, and `void sha3_keccakf_address(ethhash *)`, which is the same permutation with the last round cut to the lanes bytes 12 to 32 come from and is what the salt kernel calls. Note that both are expected to apply the trailing `0x80` pad byte themselves; see [how-address-derivation-works.md](how-address-derivation-works.md).
 
 ## How the Metal sources fit together
 

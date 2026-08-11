@@ -40,10 +40,16 @@ mod tests {
         assert!(PROFANITY.contains("__kernel void profanity_init"));
         assert!(METAL_SALT.contains("kernel void salt_iterate"));
         assert!(METAL_PROFANITY.contains("kernel void profanity_init"));
-        assert!(METAL_KECCAK.contains("void keccakf"));
+        assert!(METAL_KECCAK.contains("void keccakf(thread ulong* st)"));
+        assert!(METAL_KECCAK.contains("void keccakf_address(thread ulong* st)"));
         assert!(METAL_SCORING.contains("int score_address"));
         for keccak in [KECCAK_TUNED, KECCAK_PLAIN] {
-            assert!(keccak.contains("void sha3_keccakf"));
+            assert!(keccak.contains("void sha3_keccakf(ethhash"));
+            // The salt kernel calls the address-only permutation, and --kernel
+            // chooses the variant at run time, so a variant that does not
+            // declare it fails to build on the device the first time somebody
+            // selects it rather than here.
+            assert!(keccak.contains("void sha3_keccakf_address(ethhash"));
             assert!(keccak.contains("} ethhash;"));
             // Both variants must fold in the trailing keccak pad byte, since
             // callers only supply the leading 0x01 bit.

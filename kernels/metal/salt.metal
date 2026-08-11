@@ -3,7 +3,8 @@
  * Mirrors kernels/opencl/salt.cl. The Keccak-f permutation and the scoring
  * functions come from keccak.metal and scoring.metal, prepended to this source
  * by the host, and the permutation applies the trailing 0x80 pad byte itself
- * while callers supply the leading 0x01 bit.
+ * while callers supply the leading 0x01 bit. Nothing here reads a hash outside
+ * bytes 12 to 32, so both hashes take the address-only permutation.
  *
  * Unlike the OpenCL path, the 200-byte pre-image arrives in a buffer rather
  * than as a compile-time constant, so changing deployer, code hash or base
@@ -76,7 +77,7 @@ static void salt_derive(
         salt[i] = byte_at(state, i + 21);
     }
 
-    keccakf(state);
+    keccakf_address(state);
 
     for (uint i = 0; i < 20; ++i) {
         address[i] = byte_at(state, i + 12);
@@ -94,7 +95,7 @@ static void salt_derive(
         }
         set_byte(second, 22, 0x01);
         set_byte(second, 23, 0x01); // leading keccak pad bit
-        keccakf(second);
+        keccakf_address(second);
         for (uint i = 0; i < 20; ++i) {
             address[i] = byte_at(second, i + 12);
         }
