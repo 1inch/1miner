@@ -125,7 +125,15 @@ void salt_result_update(const uchar * const H, __global result * const pResult, 
  * branch and the hash stays live whatever this case does. profanity.cl selects
  * at compile time through PROFANITY_SCORE_KERNEL, where a constant would let
  * the keccak behind it be eliminated and the reported hashrate become fiction.
- * Do not "fix" the asymmetry in either direction.
+ * Do not "fix" the asymmetry in either direction. Building it profanity.cl's
+ * way — a SALT_SCORE_KERNEL macro instantiating eight kernels, the host picking
+ * one by name, and this case consuming the address so the keccak survives — was
+ * tried and measured at 719.9 against 717.6 MH/s for create2 on an M4 Max, with
+ * the two pairs disagreeing on which was ahead. The rate staying near 718 is
+ * also what proves the specialised benchmark kernel still hashed. So the run
+ * time switch costs nothing here, and it is the arrangement that cannot be
+ * broken by an edit to the case above: with every branch live, a constant here
+ * could not delete the hash even if someone wrote one.
  *
  * A `break` below leaves the enclosing loop, not the switch: every case returns
  * immediately after its loop, so the two readings agree anyway. */
