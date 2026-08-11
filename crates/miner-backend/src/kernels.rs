@@ -85,6 +85,32 @@ mod tests {
         }
     }
 
+    /// All three scorers test for a byte's two nibbles being equal by XORing it
+    /// with itself shifted down and looking at the low four bits, which is one
+    /// instruction rather than two masks and a compare.
+    ///
+    /// The identity is checked here over every byte there is, because it is the
+    /// sort of trick that is either right for all 256 values or wrong in a way
+    /// no realistic search would run into: the device-side test compares only
+    /// the handful of hits that clear a climbing bar, and a scorer that
+    /// undercounts by one nibble can survive it.
+    #[test]
+    fn equal_nibbles_are_what_the_scorers_test_for() {
+        for byte in 0u8..=u8::MAX {
+            let trick = ((byte >> 4) ^ byte) & 0x0f == 0;
+            let plain = (byte & 0xF0) >> 4 == byte & 0x0F;
+            assert_eq!(trick, plain, "the two forms disagree for {byte:#04x}");
+        }
+
+        for (source, form) in [
+            (PROFANITY, "(((byte >> 4) ^ byte) & 0x0f) == 0"),
+            (SALT, "(((hash[i] >> 4) ^ hash[i]) & 0x0f) == 0"),
+            (METAL_SCORING, "(((hash[i] >> 4) ^ hash[i]) & 0x0f) != 0"),
+        ] {
+            assert!(source.contains(form), "a scorer no longer reads {form}");
+        }
+    }
+
     /// `bswap32` uses its argument twice inside `&` expressions, so both uses
     /// have to be bracketed. Every call site passes a plain array element
     /// today, which is why an argument like `a | b` would go wrong quietly.

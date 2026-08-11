@@ -202,7 +202,11 @@ int salt_score(const uchar * const hash, __global const mode * const pMode) {
 
 	case Doubles:
 		for (int i = 0; i < 20; ++i) {
-			if (((hash[i] & 0xF0) >> 4) == (hash[i] & 0x0F)) {
+			// A byte's two nibbles are equal exactly when the low four bits of
+			// (byte >> 4) ^ byte are clear, which is one instruction instead of
+			// two masks, a shift and a compare. profanity.cl's scorer is already
+			// written this way; this is the same trick, not a different test.
+			if ((((hash[i] >> 4) ^ hash[i]) & 0x0f) == 0) {
 				++score;
 			} else {
 				break;

@@ -101,7 +101,10 @@ static int score_address(thread const uchar* hash, constant Mode& mode) {
 
     case kDoubles:
         for (int i = 0; i < 20; ++i) {
-            if (((hash[i] & 0xF0) >> 4) != (hash[i] & 0x0F)) { return score; }
+            // As in profanity.cl and now salt.cl: a byte's two nibbles are equal
+            // exactly when the low four bits of (byte >> 4) ^ byte are clear,
+            // which is one instruction rather than two masks and a compare.
+            if ((((hash[i] >> 4) ^ hash[i]) & 0x0f) != 0) { return score; }
             ++score;
         }
         return score;

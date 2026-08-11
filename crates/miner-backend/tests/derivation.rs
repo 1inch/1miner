@@ -681,6 +681,15 @@ fn a_chunked_round_reaches_a_later_work_item(open: impl Fn() -> Box<dyn Backend>
 /// `Benchmark` is absent because it scores nothing by construction, so it can
 /// report no hit to check. Everything else has to be here, which the coverage
 /// assertion at the end is what enforces.
+///
+/// What this does not establish: ordinary scoring only reports an improvement on
+/// the best seen so far, so a run hands back a handful of hits rather than one
+/// per candidate, and those are all there is to compare. A scorer that stops
+/// counting a nibble early survives that, which was confirmed by breaking one
+/// deliberately. A scorer that is broken outright does not, since the spec then
+/// reports nothing at all. Anything relying on an identity holding for every
+/// byte wants pinning where every byte can be tried, as `kernels.rs` does for
+/// the equal-nibble test.
 fn every_scorer_agrees_with_the_cpu(open: impl Fn() -> Box<dyn Backend>, label: &str) {
     let specs = [
         ScoreSpec::zero_bytes(),
