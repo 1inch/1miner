@@ -66,7 +66,7 @@ The salt modes never involve a key at all. The worst a hostile host could do is 
    Mode: create3 via opencl
    Kernel: keccak=tuned
    Devices:
-     GPU0: NVIDIA GeForce RTX 4090, 25757220864 bytes available, 128 compute units
+     GPU0: NVIDIA GeForce RTX 4090, 25757220864 bytes available, 128 compute units, driver 550.90.07
    Deployer: 0xyourfactory...
 
      Time:     6s  Score:  8  GPU0  Salt: 0x8954...2441  Address: 0x00000000834E17ea...
@@ -141,6 +141,69 @@ create3 --deployer 0x0000000000000000000000000000000000000000 --benchmark --seco
 
 Note that no mode finishes on its own. The salt and profanity modes keep looking for a better score, and `--exact` keeps printing matches until stopped. Either pass `--seconds` for a bounded run or destroy the instance once you have what you wanted — a running instance keeps costing money.
 
+## Measuring a machine
+
+`--benchmark` above times one mode. To decide whether an offer is worth its hourly rate, or to compare two of them, the image also carries `scripts/bench.sh` as a `bench` command that runs every mode in turn and prints one figure each:
+
+```
+Arguments: bench
+```
+
+It self-tests first and refuses to go on if the device disagrees with the CPU reference, which is the check step 3 asks you to make by eye. Then, per mode, it cools the GPU down, runs `--benchmark` with a warmup, and reports the `Measured:` line. Three profiles set how much care it takes:
+
+| Profile | Procedure | Roughly |
+|---|---|---|
+| `bench --fast` | the default. 30s cooldown, 5s warmup, 15s measured, no discarded pass | 4 minutes |
+| `bench --balanced` | 60s cooldown, 10s warmup, 30s measured, one discarded pass | 14 minutes |
+| `bench --accurate` | as above with two measured passes, and the spread printed | 21 minutes |
+
+Any of `-c` (cooldown), `-x` (discarded passes), `-w` (warmup), `-d` (measured seconds) and `-p` (passes) overrides whichever profile is in force, in either order, and the header then reports the run as custom. `bench -h` lists the rest; `-M "create3 profanity"` restricts the modes, which is the other way to make a run cheap.
+
+```
+1miner bench
+  version    1miner 0.2.0
+  binary     /usr/local/bin/1miner (built 2026-08-12 09:14)
+  profile    fast
+  procedure  cooldown 30s, warmup 5s, measured 15s, 1 pass(es), 0 discarded
+  backend    opencl (kernel tuned)
+  modes      create2 create3 1nft profanity
+  date       2026-08-12 09:20 UTC
+  estimate   about 4 minute(s), plus start-up
+
+Machine
+  cpu        AMD EPYC 7443P 24-Core Processor (8 cores)
+  memory     32 GB
+  os         Ubuntu 22.04.4 LTS, kernel 5.15.0-107-generic
+  arch       Linux x86_64
+  gpu0       NVIDIA GeForce RTX 4090, 550.90.07, 24564 MiB
+
+Checking the device against the CPU reference... ok
+
+measuring
+  create2    698.204 MH/s
+  create3    344.881 MH/s
+  1nft       344.512 MH/s
+  profanity  372.116 MH/s
+
+Devices the miner used:
+  GPU0: NVIDIA GeForce RTX 4090, 25757220864 bytes available, 128 compute units, driver 550.90.07
+
+Summary
+  mode               MH/s
+  create2         698.204
+  create3         344.881
+  1nft            344.512
+  profanity       372.116
+```
+
+The `Machine` block is there because a rate is only reproducible next to what produced it. The driver matters most — hashrates move with driver releases, and a rented machine is the one place you did not pick which one you got — and the CPU is worth a glance too: the host thread feeds each device its rounds and re-derives every hit, and an offer advertising a 24-core EPYC often hands the container eight of them. `gpu0` comes from `nvidia-smi` and lists every card on the host; the `Devices the miner used` block near the end is the list OpenCL actually opened, which is the one that respects `--skip`.
+
+Two things to hold on to when the numbers come back. Rates are not comparable **between** modes — `create3` and `1nft` hash twice per candidate where `create2` hashes once — so compare each mode against the same mode on the other machine. And `--fast` skips the discarded pass, so a freshly started instance is measured while its GPU is still cold and reads high; that bias lands in the same place on every machine you benchmark the same way, which is why the profile is still fine for ranking offers, but a figure worth quoting on its own wants `--balanced`.
+
+On a multi-GPU offer every visible device is used and the figure is their total, with a per-GPU column beside it. That column is the total divided by the device count rather than a measurement of each card, so it shows how well the box scales but not which card is the slow one.
+
+The run ends when the last mode does, unlike a search. Read the log before destroying the instance, and check on your first launch whether the platform restarts the exited container — a benchmark that quietly runs on a loop is still billed.
+
 ## Configuration
 
 Options can be given as container arguments (the *Arguments* field) or through environment variables (the *Docker Options* field, `-e NAME=value`). Environment variables are the only way to configure the run in the SSH and Jupyter launch modes, where the entrypoint is replaced and the on-start script has to start it:
@@ -180,19 +243,19 @@ Arguments: nvidia-smi    # driver version and utilisation
 Arguments: env           # the whole environment, useful for a name clash
 ```
 
-The check is an allowlist of subcommands (`profanity`, `create2`, `create3`, `1nft`, `self-test`, `help`) rather than "does it start with a dash", because 1miner's subcommands do not. A misspelled subcommand therefore fails with `exec: <name>: not found` instead of a usage error.
+The check is an allowlist of subcommands (`profanity`, `create2`, `create3`, `1nft`, `self-test`, `bench`, `help`) rather than "does it start with a dash", because 1miner's subcommands do not. A misspelled subcommand therefore fails with `exec: <name>: not found` instead of a usage error. `bench` is on that list without being a subcommand of the binary at all: it is the shipped benchmark script, which the entrypoint routes to.
 
 ## Choosing an offer
 
 Any NVIDIA card works. Worth checking:
 
 - **Driver version.** The OpenCL runtime comes from the host driver, and very old drivers occasionally fail to expose OpenCL at all. The CUDA version shown on the offer is a reasonable proxy for driver age, even though 1miner uses OpenCL rather than CUDA.
-- **Number of GPUs.** All visible devices are used, one thread each, and the score bar is shared between them. `--skip <index>` leaves one out.
+- **Number of GPUs.** All visible devices are used, one thread each, and the score bar is shared between them. `--skip <index>` leaves one out. Whether a box actually scales with its card count is a question for [`bench`](#measuring-a-machine) rather than for the offer page.
 - **Memory, for `profanity` only.** It allocates `--inverse-size` times `--inverse-multiple` points across three 32-byte buffers, so roughly 400 MB at the defaults, and initialises all of it before mining starts. Lower `-I` if a card is short on memory or takes too long to start. The salt modes need almost nothing.
 
 ## Cost
 
-Runtime grows exponentially with the length of the pattern, so estimate before renting. Each additional leading hex character multiplies expected time by 16: at 350 MH/s, eight leading zeros is minutes and twelve is months. Run the `--benchmark` line above on the instance to get its real rate, then work from that. See [benchmarking.md](benchmarking.md).
+Runtime grows exponentially with the length of the pattern, so estimate before renting. Each additional leading hex character multiplies expected time by 16: at 350 MH/s, eight leading zeros is minutes and twelve is months. Run [`bench`](#measuring-a-machine), or the single `--benchmark` line above, on the instance to get its real rate and work from that. A few minutes of rental spent measuring is cheap against a search sized from someone else's hardware. See [benchmarking.md](benchmarking.md).
 
 ## Building and pushing the image
 

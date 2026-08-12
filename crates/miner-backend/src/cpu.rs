@@ -51,6 +51,7 @@ impl CpuBackend {
                 name: format!("CPU ({threads} threads)"),
                 compute_units: threads as u32,
                 global_memory: 0,
+                driver: None,
             }],
             threads,
             profanity_base,

@@ -19,27 +19,41 @@ So create3 lands at roughly half of create2 on the same GPU, and that ratio is a
 
 GPUs throttle. A back-to-back A/B where one contender runs on a GPU the other just heated for 20 seconds will show a difference that is entirely thermal. When this project chose Rust over C++, the first naive measurement showed Rust 22% ahead purely because it ran first.
 
-`scripts/bench.sh` encodes the discipline that fixes this, so you do not have to remember it:
+Two scripts encode the discipline that fixes this, so you do not have to remember it. They answer different questions, and the answer to one is not an answer to the other.
+
+`scripts/bench-variants.sh` races contenders against each other — backends, kernel variants — for a single mode. That is the question a change to this repository asks.
 
 ```bash
-scripts/bench.sh -b "opencl metal"        # backends, one mode
-scripts/bench.sh -k "tuned plain" -p 3    # kernel variants, three passes
-scripts/bench.sh -m create2 -b "opencl metal" -o bench-results.md
+scripts/bench-variants.sh -b "opencl metal"        # backends, one mode
+scripts/bench-variants.sh -k "tuned plain" -p 3    # kernel variants, three passes
+scripts/bench-variants.sh -m create2 -b "opencl metal" -o bench-results.md
 ```
 
-What it does, and what to reproduce if you measure by hand:
+`scripts/bench.sh` measures one machine across every mode, which is the question renting hardware asks. It ships inside the container image and runs there as `1miner bench`, so a rented box needs nothing installed on it; [vastai.md](vastai.md) covers that flow.
+
+```bash
+scripts/bench.sh                          # every mode, --fast, a few minutes
+scripts/bench.sh --balanced -o rented.md
+scripts/bench.sh --accurate -M create3    # one mode, two passes, spread printed
+```
+
+What they do, and what to reproduce if you measure by hand:
+
+The flags are the same letters in both, and the defaults quoted here are `bench-variants.sh`'s; `bench.sh` takes its own from whichever profile is in force, and any flag you pass overrides that profile and relabels the run as custom.
 
 - **Cools down before every run.** `-c`, default 60 seconds idle.
 - **Throws away whole passes first.** `-x`, default one. Their figures are printed and then ignored. This is not the same thing as `-w`; see [the cooldown is not the whole problem](#the-cooldown-is-not-the-whole-problem) below.
-- **Excludes a warmup from the figure.** `-w`, default 10 seconds, is passed to the miner as `--warmup`, and the script reads the `Measured:` line the miner prints when it stops. That line is the average over everything after the warmup, so kernel compilation and the first slow round are genuinely left out rather than merely diluted.
-- **Alternates the order each pass.** Being second is a real penalty, so it must not always land on the same contender. If your means still depend on order, drift is dominating and the numbers are not yet meaningful.
+- **Excludes a warmup from the figure.** `-w`, default 10 seconds, is passed to the miner as `--warmup`, and the script reads the `Measured:` line the miner prints when it stops. That line is the average over everything after the warmup, so kernel compilation and the first slow round are genuinely left out rather than merely diluted. `bench.sh` raises it to 15 seconds for profanity whatever the profile says, because that mode initialises millions of points before it hashes anything and a warmup sized for the salt modes leaves the rate diluted by its own start-up.
+- **Alternates the order each pass**, in `bench-variants.sh`. Being second is a real penalty, so it must not always land on the same contender. If your means still depend on order, drift is dominating and the numbers are not yet meaningful. `bench.sh` fixes the order instead, and for the same underlying reason: its modes are not racing each other, and the figure it produces will be compared against another machine running the same script, so create3 always third puts the identical thermal handicap on both sides of that comparison where shuffling would only add noise to it.
 - **Repeats.** `-p`, default two passes, and it prints the min and max alongside the mean so you can see the spread rather than trusting a single figure.
-- **Says when that spread is too wide to mean anything.** If a contender's passes differ by more than 3% of its mean it prints a warning naming the contender and the percentage, because a mean over runs that disagree by 20% is otherwise reported in exactly the shape of a result.
-- **Warns if** `self-test` **fails** on the first backend, because a fast wrong kernel is the failure this project is arranged to prevent.
-- **Names the binary it is about to time**, and warns when anything under `crates/` or `kernels/` is newer than it. The candidate list prefers `./target/release/1miner`, which is the previous build until you rebuild, and benchmarking a change you have not compiled reports the change as free. `MINER=/path/to/1miner` overrides the choice.
+- **Says when that spread is too wide to mean anything.** If a contender's passes differ by more than 3% of its mean, `bench-variants.sh` prints a warning naming the contender and the percentage, because a mean over runs that disagree by 20% is otherwise reported in exactly the shape of a result.
+- **Checks** `self-test` **first.** `bench-variants.sh` warns, because a fast wrong kernel is the failure this project is arranged to prevent. `bench.sh` stops outright: it is written for hardware you are paying for by the hour and have not yet decided to keep, and spending the next quarter of an hour measuring a device that cannot derive an address correctly is not a use of that hour. `-T` overrides it.
+- **Names the binary it is about to time**, with its path and build time, and warns when anything under `crates/` or `kernels/` is newer than it. Benchmarking a change you have not compiled reports the change as free. The path is printed and not only the timestamp because there can be more than one `target/`: both scripts look in `$CARGO_TARGET_DIR` before `./target/release` for that reason, having once quietly timed a two-day-old binary on a machine where cargo was writing somewhere else entirely. `MINER=/path/to/1miner` overrides the choice.
+- **Records what the machine is.** `bench.sh` prints CPU and core count, memory, OS and — where `nvidia-smi` exists — every card on the host with its driver. The driver is the one that matters: hashrates move with driver releases, and it is what an old figure cannot be compared against a new one without. The CPU is there because the host thread feeds each device its rounds and re-derives every hit, and because a rented container is often given a fraction of the chip named on the offer. Every run of the miner itself now prints the driver beside the device in its `Devices:` block, so a search log carries it too.
+- **Says when the machine is on battery.** A laptop clocks its GPU down with the cable out and nothing else in the output mentions it: the first real run of `bench.sh` reported 189 MH/s on profanity against 271 for the identical command minutes later, and that was read as a bug in the new script until someone noticed the cable. Both scripts now check, which costs a rented machine nothing because it is always on mains.
 - **Says why a run produced no rate** instead of only that it did. A backend that refuses the mode, a flag a older binary does not know, a device already busy: all of them used to arrive as the single word FAILED, with the explanation dropped by the same pipe that reads the rate.
-- **Collapses kernel variants for backends that have one.** `-k` selects an OpenCL keccak source; Metal and CPU ignore it, so they appear once, as `metal:builtin` rather than as two identical contenders.
-- **Records provenance** with `-o`: date, host, mode, backend, kernel, the min and max, and the flags that produced the row. Neither an unlabelled hashrate nor one whose procedure went unrecorded is reproducible.
+- **Collapses kernel variants for backends that have one.** `-k` selects an OpenCL keccak source; Metal and CPU ignore it, so in `bench-variants.sh` they appear once, as `metal:builtin` rather than as two identical contenders.
+- **Records provenance** with `-o`: date, host or GPU, mode, backend, kernel, the figure, and the flags that produced it. Neither an unlabelled hashrate nor one whose procedure went unrecorded is reproducible.
 
 ## The cooldown is not the whole problem
 
@@ -96,10 +110,22 @@ mean per contender:
 
 For reference, the Rust-versus-C++gate produced 702.1 and 672.9 MH/s for the C++ binary against 712.7 and 696.4 for Rust on the identical kernel — a consistent downward drift across all four runs, with the two hosts otherwise indistinguishable.
 
+## Comparing machines
+
+```bash
+scripts/bench.sh --balanced -o machines.md
+```
+
+Renting hardware asks a different question from changing a kernel, and it is worth being explicit about which parts of the discipline above still apply to it. The cooldowns, the warmup and the discarded pass do: a machine measured the moment it starts is measured cold. Alternating the order does not, because nothing is racing anything — which is why `bench.sh` runs its modes in a fixed order, so the same position, and so the same thermal handicap, lands on the same mode on both machines.
+
+What replaces the alternation is running the identical procedure on each machine. Two `--fast` figures are comparable with each other and two `--balanced` figures are comparable with each other; a `--fast` figure against a `--balanced` one compares the procedures. The profile name is in the header of every run for that reason, and `-o` writes it into the table beside the rate.
+
+Do the comparison per mode. `create2` on one box against `create3` on another says only that create2 hashes once, which was already known.
+
 ## Comparing kernels
 
 ```bash
-scripts/bench.sh -k "tuned plain" -p 3
+scripts/bench-variants.sh -k "tuned plain" -p 3
 ```
 
 Check agreement before you believe a speedup: `cargo test --test derivation` and `1miner self-test --kernel <name>`. A kernel that is fast and wrong is worse than no kernel.
@@ -130,9 +156,16 @@ These figures were taken at a short cooldown, so trust the ranking rather than t
 
 ## Recording results
 
-Note the GPU, the driver or OS version, the backend, the kernel variant, the mode and the date. Hashrates move with driver releases, so an unlabelled number is not reproducible.
+Note the GPU, the driver or OS version, the backend, the kernel variant, the mode and the date. Hashrates move with driver releases, so an unlabelled number is not reproducible. On a laptop, note that it was plugged in — a figure taken on battery is a measurement of the power policy.
 
-Measured on an Apple M4 Max (40-core GPU), macOS 26.5, `scripts/bench.sh` with an 8-second warmup and a 20-second measured window, two passes in alternating order, August 2026. Each figure is the mean, with the spread in brackets.
+`bench.sh -o FILE` writes all of that as a markdown row per mode, and the miner prints the driver beside each device on every run, so the labelling is no longer something to remember:
+
+```
+| date | gpu | driver | os | mode | backend | kernel | MH/s | profile | flags |
+| 2026-08-12 | NVIDIA GeForce RTX 4090 | 550.90.07 | Ubuntu 22.04.4 LTS | create3 | opencl | tuned | 344.881 | fast | -c 30 -x 0 -w 5 -d 15 -p 1 |
+```
+
+Measured on an Apple M4 Max (40-core GPU), macOS 26.5, `scripts/bench-variants.sh` with an 8-second warmup and a 20-second measured window, two passes in alternating order, August 2026. Each figure is the mean, with the spread in brackets.
 
 These were taken before the 60-second cooldown and the discarded pass, so treat them as a set that is internally consistent but around one to two percent low, with spreads narrower than that procedure can actually support; the whole table is due a re-measurement under the current defaults. The one row re-measured since is create3 on OpenCL, which came out at 363.3 MH/s (358.8–366.1) over three rotated passes at a 60-second cooldown, against the 356.1 below:
 

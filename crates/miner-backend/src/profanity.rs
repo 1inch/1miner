@@ -256,6 +256,7 @@ mod tests {
             name: String::new(),
             compute_units: 0,
             global_memory: 0,
+            driver: None,
         }
     }
 

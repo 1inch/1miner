@@ -19,9 +19,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
-/// The path the shipped entrypoint execs, rewritten to the stub in the copy
-/// under test.
+/// The paths the shipped entrypoint execs, rewritten to stubs in the copy under
+/// test.
 const MINER_BIN: &str = "/usr/local/bin/1miner";
+const BENCH_BIN: &str = "/usr/local/bin/1miner-bench";
 
 /// Stands in for the miner. Records each invocation and writes to both streams
 /// so the redirect can be checked on each.
@@ -40,11 +41,21 @@ echo "err: $*" >&2
 exit "${STUB_EXIT:-0}"
 "#;
 
+/// Stands in for the shipped `scripts/bench.sh`, so that a test can tell which
+/// of the two the entrypoint chose.
+const BENCH_STUB: &str = r#"#!/bin/sh
+echo "$*" >> "$BENCH_RUNS"
+echo "bench: $*"
+exit "${BENCH_EXIT:-0}"
+"#;
+
 struct Run {
     status: ExitStatus,
     stdout: String,
     /// The argument list the stubbed miner was called with, once per call.
     runs: Vec<String>,
+    /// The same for the stubbed bench script.
+    bench_runs: Vec<String>,
     /// Contents of `MINER_OUTPUT`, for a run that set it.
     log: Option<String>,
 }
@@ -67,6 +78,10 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
     fs::write(&stub, STUB).unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let bench_stub = dir.join("1miner-bench");
+    fs::write(&bench_stub, BENCH_STUB).unwrap();
+    fs::set_permissions(&bench_stub, fs::Permissions::from_mode(0o755)).unwrap();
+
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/entrypoint.sh");
     let script = fs::read_to_string(&source).unwrap();
     assert!(
@@ -74,20 +89,29 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
         "the entrypoint no longer execs {MINER_BIN}"
     );
     assert!(
+        script.contains(BENCH_BIN),
+        "the entrypoint no longer execs {BENCH_BIN}"
+    );
+    assert!(
         script.starts_with("#!/bin/bash"),
         "the MINER_OUTPUT redirect is a bash process substitution, which sh cannot run"
     );
 
+    // The bench path first, because the miner's is a prefix of it: the other
+    // order rewrites the front of `/usr/local/bin/1miner-bench` and leaves a
+    // path that exists nowhere, so every bench assertion below would fail for
+    // a reason that has nothing to do with the entrypoint.
+    let rewritten = script
+        .replace(BENCH_BIN, bench_stub.to_str().unwrap())
+        .replace(MINER_BIN, stub.to_str().unwrap());
+
     // Executed through its own shebang, the way the image runs it.
     let entrypoint = dir.join("entrypoint.sh");
-    fs::write(
-        &entrypoint,
-        script.replace(MINER_BIN, stub.to_str().unwrap()),
-    )
-    .unwrap();
+    fs::write(&entrypoint, rewritten).unwrap();
     fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o755)).unwrap();
 
     let runs = dir.join("runs");
+    let bench_runs = dir.join("bench-runs");
     let log = output.map(|rel| dir.join(rel));
 
     let mut cmd = Command::new(&entrypoint);
@@ -98,20 +122,26 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
         // not what these tests are about.
         .env("MINER_SKIP_GPU_CHECK", "1")
         .env("STUB_RUNS", &runs)
+        .env("BENCH_RUNS", &bench_runs)
         .envs(env.iter().copied());
     if let Some(path) = &log {
         cmd.env("MINER_OUTPUT", path);
     }
     let out = cmd.output().unwrap();
 
-    Some(Run {
-        status: out.status,
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        runs: fs::read_to_string(&runs)
+    let lines = |path: &Path| -> Vec<String> {
+        fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
-            .collect(),
+            .collect()
+    };
+
+    Some(Run {
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        runs: lines(&runs),
+        bench_runs: lines(&bench_runs),
         log: log.map(|p| fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))),
     })
 }
@@ -249,6 +279,56 @@ fn miner_args_reaches_the_miner_once() {
     };
 
     assert_eq!(run.runs, ["create2 --leading 0"]);
+    assert!(run.bench_runs.is_empty(), "{:?}", run.bench_runs);
     let log = run.log.unwrap();
     assert!(log.contains("out: create2 --leading 0"), "{log:?}");
+}
+
+/// `bench` is the shipped benchmark script rather than a subcommand of the
+/// binary, so it needs both an allowlist entry and an arm of its own. With
+/// neither it reached the passthrough and the container exec'd a command called
+/// `bench`, which exists nowhere in the image.
+#[test]
+fn bench_reaches_the_script_and_not_the_miner() {
+    let Some(run) = run("bench", &["bench", "--balanced"], &[], Some("bench.log")) else {
+        return;
+    };
+
+    assert_eq!(run.bench_runs, ["--balanced"], "the subcommand is consumed");
+    assert!(
+        run.runs.is_empty(),
+        "the miner was run directly: {:?}",
+        run.runs
+    );
+    assert!(run.status.success(), "{:?}", run.status);
+    let log = run.log.unwrap();
+    assert!(log.contains("bench: --balanced"), "{log:?}");
+}
+
+/// Benchmarking is most worth automating on exactly the panels that offer no
+/// command line, so the dispatch sits below the `MINER_ARGS` fallback rather
+/// than beside the passthrough.
+#[test]
+fn bench_reaches_the_script_from_miner_args_too() {
+    let env = [("MINER_ARGS", "bench --fast -M create3")];
+    let Some(run) = run("bench_args", &[], &env, None) else {
+        return;
+    };
+
+    assert_eq!(run.bench_runs, ["--fast -M create3"]);
+    assert!(run.runs.is_empty(), "{:?}", run.runs);
+}
+
+/// A benchmark that ran on a device failing its self-test is worth nothing, and
+/// the script exits non-zero to say so. That has to survive the entrypoint for
+/// the same reason a search's status does.
+#[test]
+fn the_bench_scripts_exit_status_survives() {
+    let env = [("BENCH_EXIT", "1")];
+    let Some(run) = run("bench_status", &["bench"], &env, Some("bench.log")) else {
+        return;
+    };
+
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(run.bench_runs.len(), 1, "{:?}", run.bench_runs);
 }

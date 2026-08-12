@@ -28,9 +28,12 @@ if [ -n "${MINER_OUTPUT:-}" ]; then
     exec 1> >(tee -a "$MINER_OUTPUT") 2>&1
 fi
 
+# `bench` is in the list without being a 1miner subcommand: it is the shipped
+# scripts/bench.sh, dispatched below. Left out, it would fall through to the
+# passthrough and be exec'd as a command that does not exist.
 is_subcommand() {
     case "$1" in
-        profanity|create2|create3|1nft|self-test|help) return 0 ;;
+        profanity|create2|create3|1nft|self-test|bench|help) return 0 ;;
         -*) return 0 ;;
         *) return 1 ;;
     esac
@@ -75,6 +78,15 @@ if [ "$wants_gpu" = "1" ] && [ "${MINER_SKIP_GPU_CHECK:-0}" != "1" ]; then
         echo "  'docker run --rm --gpus all <image> clinfo' shows what the runtime sees." >&2
         echo "  Set MINER_SKIP_GPU_CHECK=1 to silence this." >&2
     fi
+fi
+
+# Dispatched here rather than beside the passthrough above, so that `bench`
+# reaches it from MINER_ARGS as well — the panels that offer an environment and
+# no command line are the same ones where measuring a machine by hand is
+# awkward enough to want this.
+if [ "$1" = "bench" ]; then
+    shift
+    exec /usr/local/bin/1miner-bench "$@"
 fi
 
 exec /usr/local/bin/1miner "$@"

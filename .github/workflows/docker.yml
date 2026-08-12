@@ -56,6 +56,13 @@ jobs:
           ! docker run --rm -e MINER_OUTPUT=/tmp/run.log 1miner:ci create3 \
             --deployer 0x0000000000000000000000000000000000000001 \
             --leading 0
+          # `bench` is a script beside the binary rather than a subcommand of
+          # it, so the entrypoint routes it and only the image proves that the
+          # script was copied in and made executable at all.
+          docker run --rm 1miner:ci bench -h | grep -q 'Whole-machine benchmark'
+          # Its self-test gate is what should stop it here, before it spends
+          # several minutes measuring a machine that cannot mine.
+          ! docker run --rm 1miner:ci bench --fast
 
       - name: Read the version out of the image
         id: version

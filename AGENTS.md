@@ -11,7 +11,7 @@ crates/miner-cli/      clap surface, terminal output, self-test.
 kernels/opencl/        keccak_tuned.cl, keccak_plain.cl, salt.cl, profanity.cl
 kernels/metal/         keccak.metal, scoring.metal, salt.metal, profanity.metal
 docs/                  user and contributor documentation.
-scripts/               bench.sh benchmark harness; profanity-keygen.sh and profanity-final-key.sh, the seed keypair and the offset-to-key step.
+scripts/               bench.sh whole-machine benchmark, also shipped in the image as `1miner bench`; bench-variants.sh backend and kernel A/B; profanity-keygen.sh and profanity-final-key.sh, the seed keypair and the offset-to-key step.
 references/            upstream C++ miners (profanity2, ERADICATE2/3). Gitignored, read-only.
 ```
 
@@ -29,7 +29,8 @@ cargo test --test derivation              # cross-backend agreement tests
 cargo fmt --all --check                   # CI runs this, so run it before pushing
 cargo clippy --workspace --all-targets -- -D warnings
 ./target/release/1miner self-test         # check the device actually present
-scripts/bench.sh -b "opencl metal"        # see docs/benchmarking.md before quoting a number
+scripts/bench.sh                          # every mode on this machine
+scripts/bench-variants.sh -b "opencl metal"  # backends or kernels raced against each other
 ```
 
 GPU-dependent tests print a `skipping` line and pass when no device is present, so the suite still runs in CI and in a container. Keep it that way.
@@ -66,7 +67,9 @@ Every failure mode here is silent: a wrong pad byte or the wrong nonce still pro
 
 ## Benchmarks
 
-Never quote a hashrate from a single back-to-back run. GPUs throttle, and this project's own Rust-versus-C++ comparison first showed Rust 22% ahead purely because it ran on a cold GPU. Use `scripts/bench.sh`, which cools down before each run, excludes a warmup, alternates the order between passes and prints the spread. Quote the `Measured:` line, not the live rolling window. Rates are not comparable across modes: `create3` and `1nft` hash twice, `create2` once. Record GPU, driver or OS version, backend, kernel, mode and date.
+Never quote a hashrate from a single back-to-back run. GPUs throttle, and this project's own Rust-versus-C++ comparison first showed Rust 22% ahead purely because it ran on a cold GPU. Both scripts cool down before each run, exclude a warmup and can discard whole passes; quote the `Measured:` line, not the live rolling window. Rates are not comparable across modes: `create3` and `1nft` hash twice, `create2` once. Record GPU, driver or OS version, backend, kernel, mode and date — `bench.sh -o FILE` writes all of it as a table row, and `DeviceInfo::driver` puts the driver version in every run's `Devices:` block, so a search log carries it too.
+
+Which script depends on the question. `scripts/bench-variants.sh` races contenders — backends, kernel variants — for one mode, and alternates their order between passes because being second is a penalty that must not always land on the same one. `scripts/bench.sh` measures one machine across every mode, keeps a fixed order because nothing is racing, and gates on `self-test` rather than warning, since it is written for hardware rented by the hour. It ships in the container image as `1miner bench`, so `docker/entrypoint.sh` and the Dockerfile both have to keep up with it; the entrypoint tests pin the dispatch.
 
 ## Environment
 

@@ -215,8 +215,16 @@ fn print_devices(
     }
     println!("Devices:");
     for device in backend.devices() {
+        // The driver goes on the same line as the device it belongs to, because
+        // the pair is what a recorded hashrate has to be labelled with: the
+        // figure moves with driver releases, and on a rented machine the driver
+        // is the one part of it nobody chose.
+        let driver = match &device.driver {
+            Some(version) => format!(", driver {version}"),
+            None => String::new(),
+        };
         println!(
-            "  GPU{}: {}, {} bytes available, {} compute units",
+            "  GPU{}: {}, {} bytes available, {} compute units{driver}",
             device.index, device.name, device.global_memory, device.compute_units
         );
     }

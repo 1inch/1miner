@@ -66,7 +66,11 @@ COPY LICENSE /usr/share/doc/1miner/LICENSE
 # The entrypoint needs bash for the MINER_OUTPUT redirect, which bookworm-slim
 # has and a slimmer base such as alpine would not.
 COPY docker/entrypoint.sh /usr/local/bin/1miner-entrypoint
-RUN chmod +x /usr/local/bin/1miner-entrypoint /usr/local/bin/1miner \
+# `1miner bench` on a rented box, where the image is everything the machine
+# has. Deciding whether an offer is worth its hourly rate otherwise means
+# typing the whole procedure into a template field.
+COPY scripts/bench.sh /usr/local/bin/1miner-bench
+RUN chmod +x /usr/local/bin/1miner-entrypoint /usr/local/bin/1miner-bench /usr/local/bin/1miner \
     && mkdir -p /workspace
 
 WORKDIR /workspace

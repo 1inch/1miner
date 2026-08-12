@@ -62,6 +62,10 @@ impl MetalBackend {
             name: device.name().to_string(),
             compute_units: 0,
             global_memory: device.recommendedMaxWorkingSetSize(),
+            // Metal ships with the OS rather than with a driver of its own, so
+            // the macOS version is what a Metal figure has to be recorded
+            // against; there is nothing to ask the device for.
+            driver: None,
         }];
         Ok(Self { infos, device })
     }

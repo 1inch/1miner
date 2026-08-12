@@ -67,6 +67,7 @@ pub fn enumerate_devices(skip: &[usize]) -> Result<Vec<(DeviceId, DeviceInfo)>> 
                     .unwrap_or_else(|_| format!("OpenCL device {index}")),
                 compute_units: device.max_compute_units().unwrap_or(0),
                 global_memory: device.global_mem_size().unwrap_or(0),
+                driver: device.driver_version().ok(),
             },
         ));
     }

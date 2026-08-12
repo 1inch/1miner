@@ -51,7 +51,7 @@ No mode ever assumes a deployer address. A salt mined against the wrong deployer
 
 ## Performance
 
-Measured on an Apple M4 Max (40-core GPU) with `scripts/bench.sh`: 20-second windows after an 8-second warmup, two passes in alternating order.
+Measured on an Apple M4 Max (40-core GPU) with `scripts/bench-variants.sh`: 20-second windows after an 8-second warmup, two passes in alternating order.
 
 
 | Mode           | Backend                | Speed      |
@@ -67,6 +67,8 @@ Measured on an Apple M4 Max (40-core GPU) with `scripts/bench.sh`: 20-second win
 
 CREATE3 runs at about half of CREATE2 because it hashes twice: CREATE2 for the proxy, then CREATE for the contract. Rates are not comparable across modes for that reason. The profanity Metal figure is approximate because the two GPU backends sit closer together than a single pass varies; [docs/benchmarking.md](docs/benchmarking.md) shows the passes behind it and why every figure here is worth re-measuring on your own hardware.
 
+`scripts/bench.sh` does that re-measurement — every mode on one machine, which is also how to compare two rented GPUs — and `scripts/bench-variants.sh` races backends and kernels against each other on a machine you already have.
+
 ## Docker
 
 A prebuilt image with the OpenCL runtime is available, so nothing has to be installed on the machine that does the searching:
@@ -74,6 +76,9 @@ A prebuilt image with the OpenCL runtime is available, so nothing has to be inst
 ```bash
 docker run --rm --gpus all ghcr.io/1inch/1miner:latest self-test
 docker run --rm --gpus all ghcr.io/1inch/1miner:latest create3 --deployer 0xFactory --leading 0
+
+# Every mode benchmarked on the machine in front of you, to decide whether to keep it.
+docker run --rm --gpus all ghcr.io/1inch/1miner:latest bench
 ```
 
 Kernels are embedded in the binary, so the image needs no files beside it. For rented GPUs see [docs/vastai.md](docs/vastai.md).

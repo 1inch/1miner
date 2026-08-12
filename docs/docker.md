@@ -5,6 +5,7 @@ A prebuilt image is published to GHCR by [`.github/workflows/docker.yml`](../.gi
 ```bash
 docker run --rm --gpus all ghcr.io/1inch/1miner:latest self-test
 docker run --rm --gpus all ghcr.io/1inch/1miner:latest create3 --deployer 0xFactory --leading 0
+docker run --rm --gpus all ghcr.io/1inch/1miner:latest bench
 ```
 
 Publishing is keyed on the version rather than on the commit. Every push to `main` builds the image and smoke-tests it, but it reaches the registry only when the workspace `version` in `Cargo.toml` is not in GHCR already: bumping `0.1.0` to `0.1.1` publishes `0.1.1`, `0.1` and `latest`, and the commits that follow at `0.1.1` publish nothing. So `:latest` tracks the last released version, not the tip of `main`. See [Releasing](#releasing).
@@ -47,7 +48,9 @@ Two properties are worth stating rather than discovering.
 
 The miner runs as **root**: the image sets no `USER`. Adding one risks access to the GPU device nodes on host and toolkit combinations nobody here can test against, which is a poor trade for a container the operator already controls end to end.
 
-The first argument reaches `exec` whenever it is not a 1miner subcommand or a flag, so the container is a general command runner and not only a miner. [`docker/entrypoint.sh`](../docker/entrypoint.sh) decides this from an explicit allowlist — `profanity`, `create2`, `create3`, `1nft`, `self-test`, `help`, and anything beginning with `-` — rather than guessing from the shape of the argument, because 1miner's own subcommands do not start with a dash. `clinfo`, `nvidia-smi` and `sh` working for diagnosing a bad rental is the point of it. `MINER_ARGS` cannot reach that branch: it is consulted only when no arguments were given at all, so an environment variable can never turn into an arbitrary command.
+The first argument reaches `exec` whenever it is not a 1miner subcommand or a flag, so the container is a general command runner and not only a miner. [`docker/entrypoint.sh`](../docker/entrypoint.sh) decides this from an explicit allowlist — `profanity`, `create2`, `create3`, `1nft`, `self-test`, `bench`, `help`, and anything beginning with `-` — rather than guessing from the shape of the argument, because 1miner's own subcommands do not start with a dash. `clinfo`, `nvidia-smi` and `sh` working for diagnosing a bad rental is the point of it. `MINER_ARGS` cannot reach that branch: it is consulted only when no arguments were given at all, so an environment variable can never turn into an arbitrary command.
+
+`bench` is on that allowlist without being a subcommand of the binary. It is [`scripts/bench.sh`](../scripts/bench.sh), copied into the image as `/usr/local/bin/1miner-bench` and dispatched by the entrypoint, and it benchmarks every mode on the machine the container is running on — see [benchmarking.md](benchmarking.md) and [vastai.md](vastai.md). The dispatch sits below the `MINER_ARGS` fallback so that a panel offering only environment variables can still reach it, which widens what that variable can start by exactly one fixed script and no further.
 
 Both are deliberate for a container you start yourself on hardware you rented. Revisit them if the image is ever run somewhere multi-tenant, or anywhere its arguments come from someone else.
 
@@ -95,6 +98,8 @@ All visible devices are used, one thread each. Restrict with either Docker or 1m
 docker run --rm --gpus '"device=0,1"' 1miner create3 --deployer 0x... --leading 0
 docker run --rm --gpus all 1miner create3 --deployer 0x... --leading 0 --skip 2 --skip 3
 ```
+
+`bench` reports the total across whatever it was given and a per-GPU column beside it, which is the cheapest way to find out whether a box with four cards is worth four times one — some are not.
 
 ## Releasing
 

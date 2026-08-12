@@ -284,6 +284,13 @@ pub struct DeviceInfo {
     pub name: String,
     pub compute_units: u32,
     pub global_memory: u64,
+    /// The vendor driver behind this device, where the backend has a notion of
+    /// one. A hashrate moves with driver releases, so a figure recorded without
+    /// it cannot be compared against a later one — and on rented hardware the
+    /// driver is the part of the machine nobody chose. `None` for backends
+    /// where the question does not arise: Metal is versioned by the OS, and the
+    /// CPU backend has no driver at all.
+    pub driver: Option<String>,
 }
 
 pub trait Backend {
