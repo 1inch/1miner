@@ -63,8 +63,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 # files to keep beside it and no working-directory requirement.
 COPY --from=build /src/target/release/1miner /usr/local/bin/1miner
 COPY LICENSE /usr/share/doc/1miner/LICENSE
-# The entrypoint needs bash for the MINER_OUTPUT redirect, which bookworm-slim
-# has and a slimmer base such as alpine would not.
+# The entrypoint needs bash for PIPESTATUS, which is the only way the miner's
+# exit status leaves the MINER_OUTPUT pipeline. bookworm-slim has bash; a
+# slimmer base such as alpine would not.
 COPY docker/entrypoint.sh /usr/local/bin/1miner-entrypoint
 # `1miner bench` on a rented box, where the image is everything the machine
 # has. Deciding whether an offer is worth its hourly rate otherwise means
