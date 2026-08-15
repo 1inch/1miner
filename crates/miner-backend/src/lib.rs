@@ -264,6 +264,40 @@ pub fn drain_hits(
     guard.len()
 }
 
+/// Queue the best candidate a producer found, raising the bar with it.
+///
+/// Reading the bar, raising it and queueing the hit are one critical section
+/// because the three have to agree. Left separate they do not: two producers
+/// can each read the same bar and each decide to report, and the order they
+/// then reach the queue in has nothing to do with their scores, so a run that
+/// prints only improvements prints a score lower than the one before it. The
+/// bar itself also falls, when the lower of the two writes last, and every
+/// candidate between the two values is then reported a second time.
+///
+/// Neither shows up as a failure. Both were found by the CPU backend's own
+/// test rather than by anyone watching output, and only about once in eight
+/// runs.
+///
+/// `take` is handed the bar in force and returns the best candidate above it,
+/// or nothing; it runs under the lock so that the bar it filtered against is
+/// still the bar when the hit is queued. A caller examining candidates one at
+/// a time should test the bar again without the lock first, so that only a
+/// candidate which already looks like a hit pays for taking it.
+pub fn queue_best(
+    queue: &std::sync::Mutex<Vec<Progress>>,
+    best: &std::sync::atomic::AtomicU64,
+    take: impl FnOnce(u64) -> Option<(u32, Hit)>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut guard = queue.lock().unwrap();
+    let Some((score, hit)) = take(best.load(Ordering::Relaxed)) else {
+        return;
+    };
+    best.store(u64::from(score), Ordering::Relaxed);
+    guard.push(Progress::Hit(hit));
+}
+
 /// Progress callbacks, invoked from the run loop.
 pub trait Reporter: Send {
     fn on_hit(&mut self, hit: &Hit);
@@ -333,5 +367,69 @@ mod tests {
     fn a_zero_width_still_covers_the_launch() {
         assert_eq!(chunks(3, 0).collect::<Vec<_>>(), [(0, 1), (1, 1), (2, 1)]);
         assert_eq!(chunks(0, 8).count(), 0);
+    }
+
+    /// Producers racing on one bar must still queue an improving run.
+    ///
+    /// This pins the invariant where it is enforced rather than where it was
+    /// noticed. It was noticed in the CPU backend's own end-to-end test, which
+    /// caught the split version about once in eight runs — often enough to make
+    /// the suite unreliable and rare enough to be re-run until green. Every
+    /// thread here offers every score, so a `load` and a `store` in place of
+    /// the critical section fails it on the first attempt instead.
+    #[test]
+    fn a_shared_bar_queues_an_improving_run_under_contention() {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicU64;
+
+        for attempt in 0..64 {
+            let queue: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
+            let best = AtomicU64::new(0);
+
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let (queue, best) = (&queue, &best);
+                    scope.spawn(move || {
+                        for score in 1..=MAX_SCORE as u32 {
+                            queue_best(queue, best, |bar| {
+                                (u64::from(score) > bar).then(|| (score, hit(score)))
+                            });
+                        }
+                    });
+                }
+            });
+
+            let queued = queue.lock().unwrap();
+            let scores: Vec<u32> = queued
+                .iter()
+                .map(|found| match found {
+                    Progress::Hit(hit) => hit.score,
+                    Progress::Dropped { .. } => unreachable!("nothing drops here"),
+                })
+                .collect();
+
+            assert!(
+                scores.windows(2).all(|pair| pair[1] > pair[0]),
+                "attempt {attempt} queued {scores:?}"
+            );
+            assert_eq!(
+                best.load(std::sync::atomic::Ordering::Relaxed),
+                u64::from(MAX_SCORE as u32),
+                "the bar has to end where the highest score left it"
+            );
+        }
+    }
+
+    fn hit(score: u32) -> Hit {
+        Hit {
+            score,
+            address: [0u8; 20],
+            salt: None,
+            magic: None,
+            offset: None,
+            pattern: None,
+            device_index: 0,
+            verified: true,
+        }
     }
 }
