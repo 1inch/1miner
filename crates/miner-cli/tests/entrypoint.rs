@@ -4,7 +4,7 @@
 //! absolute path that exists only inside the image. These tests run the real
 //! file with that one path rewritten to a stub, so everything else — the
 //! shebang, the passthrough allowlist, `MINER_ARGS`, the `MINER_OUTPUT`
-//! redirect — is exercised as written.
+//! pipeline — is exercised as written.
 //!
 //! Two invariants, both of which `MINER_OUTPUT` broke while it teed through a
 //! pipeline: the miner runs exactly once, and the container exits with the
@@ -94,7 +94,7 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
     );
     assert!(
         script.starts_with("#!/bin/bash"),
-        "the MINER_OUTPUT redirect is a bash process substitution, which sh cannot run"
+        "PIPESTATUS carries the miner's status out of the logging pipeline, and sh has no such thing"
     );
 
     // The bench path first, because the miner's is a prefix of it: the other
@@ -118,6 +118,9 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
     cmd.args(args)
         .env_remove("MINER_ARGS")
         .env_remove("MINER_OUTPUT")
+        // The re-entry guard, in case the suite itself was started from inside
+        // a wrapped run.
+        .env_remove("MINER_LOG_WRAPPED")
         // clinfo is not on a developer's machine, and the warning it guards is
         // not what these tests are about.
         .env("MINER_SKIP_GPU_CHECK", "1")
@@ -146,19 +149,23 @@ fn run(name: &str, args: &[&str], env: &[(&str, &str)], output: Option<&str>) ->
     })
 }
 
-/// bash and an openable `/dev/fd`, which is what `exec 1> >(tee ...)` needs. A
-/// sandbox that forbids `/dev/fd` cannot run these tests at all, so skip rather
-/// than report a failure that does not belong to the script.
+/// A bash that knows PIPESTATUS, which is what carries the miner's status out
+/// of the logging pipeline. Somewhere without one cannot run these tests at all,
+/// so skip rather than report a failure that does not belong to the script.
+///
+/// The redirect this replaced needed an openable `/dev/fd` as well, for its
+/// process substitution. An ordinary pipeline does not, so one fewer thing about
+/// the host has to be true before a logged run works.
 fn usable_shell() -> bool {
     match Command::new("bash")
-        .args(["-c", "exec 1> >(cat >/dev/null)"])
+        .args(["-c", "true | true; exit ${PIPESTATUS[0]}"])
         .output()
     {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             let why = String::from_utf8_lossy(&out.stderr);
             eprintln!(
-                "skipping entrypoint test: no process substitution here: {}",
+                "skipping entrypoint test: bash cannot run it: {}",
                 why.trim()
             );
             false
