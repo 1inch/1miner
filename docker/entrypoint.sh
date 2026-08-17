@@ -30,7 +30,7 @@ set -eu
 # which leaves through the passthrough below. Nothing after this block changes
 # shape: the re-entry guard sends the inner run down the ordinary exec path,
 # where exec is safe because that shell is a child rather than init.
-if [ -n "${MINER_OUTPUT:-}" ] && [ -z "${MINER_LOG_WRAPPED:-}" ]; then
+if [[ -n "${MINER_OUTPUT:-}" && -z "${MINER_LOG_WRAPPED:-}" ]]; then
     mkdir -p "$(dirname "$MINER_OUTPUT")"
     export MINER_LOG_WRAPPED=1
     # A signal that arrives while a foreground pipeline runs is deferred until
@@ -59,7 +59,7 @@ is_subcommand() {
     esac
 }
 
-if [ "$#" -gt 0 ] && ! is_subcommand "$1"; then
+if [[ "$#" -gt 0 ]] && ! is_subcommand "$1"; then
     exec "$@"
 fi
 
@@ -68,8 +68,8 @@ fi
 # The image deliberately sets no CMD: a default would arrive here as a real
 # argument and MINER_ARGS would never be consulted, which is how this went
 # unnoticed the first time.
-if [ "$#" -eq 0 ]; then
-    if [ -n "${MINER_ARGS:-}" ]; then
+if [[ "$#" -eq 0 ]]; then
+    if [[ -n "${MINER_ARGS:-}" ]]; then
         # Deliberately unquoted: MINER_ARGS holds a whole argument list.
         # shellcheck disable=SC2086
         set -- $MINER_ARGS
@@ -85,16 +85,18 @@ case "${1:-}" in
     -h|--help|-V|--version|help|"") wants_gpu=0 ;;
     # The harness has a help of its own, and getopts gives it only the one
     # spelling.
-    bench) case "${2:-}" in -h) wants_gpu=0 ;; esac ;;
+    bench) case "${2:-}" in -h) wants_gpu=0 ;; *) ;; esac ;;
+    *) ;;
 esac
 for arg in "$@"; do
     case "$arg" in
         --backend=cpu) wants_gpu=0 ;;
+        *) ;;
     esac
 done
 
 # Fail loudly and early rather than after the rental clock has started.
-if [ "$wants_gpu" = "1" ] && [ "${MINER_SKIP_GPU_CHECK:-0}" != "1" ]; then
+if [[ "$wants_gpu" = "1" && "${MINER_SKIP_GPU_CHECK:-0}" != "1" ]]; then
     if ! clinfo -l 2>/dev/null | grep -qi 'device'; then
         echo "warning: no OpenCL devices are visible to the container." >&2
         echo "  Pass --gpus all to docker run and check the host driver is installed." >&2
@@ -107,7 +109,7 @@ fi
 # reaches it from MINER_ARGS as well — the panels that offer an environment and
 # no command line are the same ones where measuring a machine by hand is
 # awkward enough to want this.
-if [ "$1" = "bench" ]; then
+if [[ "$1" = "bench" ]]; then
     shift
     exec /usr/local/bin/1miner-bench "$@"
 fi
