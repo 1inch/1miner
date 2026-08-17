@@ -17,7 +17,9 @@ use miner_core::{
 use rand::RngCore;
 
 use crate::speed::{DEFAULT_WINDOW, SpeedMeter};
-use crate::{Backend, BackendError, DeviceInfo, Hit, Job, Progress, Reporter, Result, drain_hits};
+use crate::{
+    Backend, BackendError, DeviceInfo, Hit, Job, Progress, Reporter, Result, drain_hits, queue_best,
+};
 
 pub struct CpuBackend {
     infos: Vec<DeviceInfo>,
@@ -122,12 +124,13 @@ impl CpuBackend {
                             let lanes = if paired { 2 } else { 1 };
 
                             for lane in 0..lanes {
-                                let Some((value, pattern)) = examine(job, &addresses[lane], best)
+                                let bar = best.load(Ordering::Relaxed);
+                                let Some((value, pattern)) = examine(job, &addresses[lane], bar)
                                 else {
                                     continue;
                                 };
                                 let salt = cfg.salt_at(0, pair[lane], round);
-                                hits.lock().unwrap().push(Progress::Hit(Hit {
+                                let hit = Hit {
                                     score: value,
                                     address: addresses[lane],
                                     salt: Some(salt),
@@ -138,7 +141,15 @@ impl CpuBackend {
                                     // Derived on the CPU to begin with, so
                                     // there is nothing left to cross-check.
                                     verified: true,
-                                }));
+                                };
+                                if job.is_exact() {
+                                    // No bar to take, and every match is wanted.
+                                    hits.lock().unwrap().push(Progress::Hit(hit));
+                                } else {
+                                    queue_best(hits, best, |bar| {
+                                        (u64::from(value) > bar).then_some((value, hit))
+                                    });
+                                }
                             }
 
                             done += lanes as u64;
@@ -195,11 +206,17 @@ impl CpuBackend {
             BackendError::Other("the starting offset cancels the seed public key".into())
         })?;
         let mut steps: u64 = 0;
-        let best = AtomicU64::new(0);
+        // A plain integer, not the shared bar the salt path needs: this loop is
+        // the only producer, so there is nothing to race with and nothing to
+        // hold a lock against.
+        let mut best: u64 = 0;
 
         while !should_stop() && !job.expired(start) {
             let address = cfg.address_for_point(&point);
-            if let Some((value, pattern)) = examine(job, &address, &best) {
+            if let Some((value, pattern)) = examine(job, &address, best) {
+                if !job.is_exact() {
+                    best = u64::from(value);
+                }
                 let offset = offset_scalar(&base, steps);
                 // The offset is rebuilt from the base and the step count rather
                 // than read off the walk, so the two can drift; re-deriving the
@@ -253,9 +270,14 @@ impl CpuBackend {
 ///
 /// The two questions the backends ask, in one place because the CPU asks both
 /// of them in two loops. `--exact` wants every address satisfying a mask and
-/// has no bar; scoring wants each improvement on the best seen anywhere, and
-/// raises the bar as it goes.
-fn examine(job: &Job, address: &Address, best: &AtomicU64) -> Option<(u32, Option<usize>)> {
+/// has no bar; scoring wants each improvement on the best seen anywhere.
+///
+/// It only answers, and does not raise the bar. Every candidate passes through
+/// here, so the test against `bar` is deliberately unlocked and therefore only
+/// a filter: the few that get past it are tested again under the queue's lock
+/// by [`queue_best`], which is what keeps the bar and the order hits are
+/// queued in agreeing with each other.
+fn examine(job: &Job, address: &Address, bar: u64) -> Option<(u32, Option<usize>)> {
     match job.exact.as_deref() {
         Some(masks) => {
             let pattern = first_exact_match(masks, address)?;
@@ -263,11 +285,7 @@ fn examine(job: &Job, address: &Address, best: &AtomicU64) -> Option<(u32, Optio
         }
         None => {
             let value = score(&job.score, address) as u64;
-            if value == 0 || value <= best.load(Ordering::Relaxed) {
-                return None;
-            }
-            best.store(value, Ordering::Relaxed);
-            Some((value as u32, None))
+            (value > 0 && value > bar).then_some((value as u32, None))
         }
     }
 }

@@ -25,8 +25,8 @@ use crate::profanity::{
     device_seed, init_chunk, precomp_table,
 };
 use crate::{
-    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
-    RESULT_SLOTS, Reporter, Result, chunks, kernels,
+    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, RESULT_SLOTS,
+    Reporter, Result, chunks, kernels, queue_best,
 };
 
 pub struct ProfanityBackend {
@@ -328,26 +328,24 @@ fn run_device(
             seed: &seed,
             round,
         };
-        let found = if job.is_exact() {
+        if job.is_exact() {
             // Slot 0 counts this round's matches, including any the buffer had
             // no room for.
-            context.drain_exact(&results, results[0].found)
-        } else {
-            let threshold = run.best_score.load(Ordering::Relaxed);
-            // Every device's progress, not just this one's, so a device that is
-            // behind stops writing results the host reads and throws away.
-            local_best = threshold as cl_uchar;
-            match context.take_best(&results, threshold) {
-                Some((score, hit)) => {
-                    run.best_score.store(u64::from(score), Ordering::Relaxed);
-                    local_best = score as cl_uchar;
-                    vec![Progress::Hit(hit)]
-                }
-                None => Vec::new(),
+            let found = context.drain_exact(&results, results[0].found);
+            if !found.is_empty() {
+                run.hits.lock().unwrap().extend(found);
             }
-        };
-        if !found.is_empty() {
-            run.hits.lock().unwrap().extend(found);
+        } else {
+            // The bar is read, raised and queued against in one step, for the
+            // reason `queue_best` gives: devices share it, and separating the
+            // three lets a later round report a score below an earlier one.
+            queue_best(run.hits, run.best_score, |threshold| {
+                context.take_best(&results, threshold)
+            });
+            // Read after the queue rather than before, so this kernel's bar
+            // becomes the best any device has reached instead of leaving a
+            // device that is behind writing results the host throws away.
+            local_best = run.best_score.load(Ordering::Relaxed) as cl_uchar;
         }
     }
 

@@ -22,8 +22,8 @@ use super::{
 };
 use crate::salt::{SaltRound, SaltSlot};
 use crate::{
-    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, Progress,
-    RESULT_SLOTS, Reporter, Result, chunks, kernels, wire,
+    Backend, BackendError, DeviceInfo, EXACT_CAPACITY, Job, KeccakVariant, MAX_SCORE, RESULT_SLOTS,
+    Reporter, Result, chunks, kernels, queue_best, wire,
 };
 
 /// The scoring mode and the exact masks are different shapes bound to the same
@@ -254,22 +254,20 @@ fn run_device(
 
         run.counter.fetch_add(round_size as u64, Ordering::Relaxed);
 
-        let found = if job.is_exact() {
+        if job.is_exact() {
             // Slot 0 counts this round's matches, including any the buffer had
             // no room for.
-            reader.drain_exact(&results, results[0].found)
-        } else {
-            let threshold = run.best_score.load(Ordering::Relaxed);
-            match reader.take_best(&results, threshold) {
-                Some((score, hit)) => {
-                    run.best_score.store(u64::from(score), Ordering::Relaxed);
-                    vec![Progress::Hit(hit)]
-                }
-                None => Vec::new(),
+            let found = reader.drain_exact(&results, results[0].found);
+            if !found.is_empty() {
+                run.hits.lock().unwrap().extend(found);
             }
-        };
-        if !found.is_empty() {
-            run.hits.lock().unwrap().extend(found);
+        } else {
+            // The bar is read, raised and queued against in one step, for the
+            // reason `queue_best` gives: devices share it, and separating the
+            // three lets a later round report a score below an earlier one.
+            queue_best(run.hits, run.best_score, |threshold| {
+                reader.take_best(&results, threshold)
+            });
         }
         // After the drain rather than before, because reporting publishes the
         // score: one load then raises this kernel's bar to the best any device
