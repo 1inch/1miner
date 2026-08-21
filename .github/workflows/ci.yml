@@ -19,7 +19,7 @@ jobs:
     name: fmt and clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Only the registry, not target/. Cargo decides staleness partly on
       # mtimes, which a restored directory does not preserve faithfully — the
@@ -27,7 +27,7 @@ jobs:
       # cache that silently reuses a stale artefact is worse here than a slow
       # build.
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -69,10 +69,10 @@ jobs:
             features: '--features metal'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -114,10 +114,10 @@ jobs:
     name: build without a GPU backend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
