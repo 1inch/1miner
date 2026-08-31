@@ -71,7 +71,7 @@ Every scoring mode works here: `--leading`, `--matching`, `--zero-bytes`, `--mir
   Time:     0s  Score:  5  GPU0  Magic: 0xd0d3cef9872bfa6d4a1b7cf826b68d9f  Address: 0x44179788579a5D52006eFA9500Af423400700000
 ```
 
-That line is a real hit for the 1inch deployer and account `0x00000000219ab540356cbb839cbe05303d7705fa`, scored on zero bytes. Every hit is re-derived on the CPU before it is printed, so a magic that does not actually produce the address shown is reported as an error rather than as a result.
+That line is a real hit for the 1inch deployer and account `0x00000000219ab540356cbb839cbe05303d7705fa`, scored on zero bytes. Every hit is re-derived on the CPU before it is printed, so a magic that does not actually produce the address shown is reported as an error rather than as a result. The magic is checked against `--mint-for` too, by rebuilding the salt the way the deployer does, which is what a hit reported by a device you do not trust could otherwise get wrong; that check runs even under `--no-verify`.
 
 ## Check it against the contract before you mint
 

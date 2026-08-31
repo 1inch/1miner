@@ -10,9 +10,17 @@ Every hit is re-derived on the CPU before it is printed. For salt modes the repo
 
 This is the highest-value check in the project because it protects *real runs*, including on hardware and kernel variants nobody has tested. Hits are rare, so one CPU keccak per hit costs nothing measurable.
 
-A hit that fails is printed with `[UNVERIFIED: CPU re-derivation disagrees with the kernel]` and the process exits non-zero. That is a correctness bug, not a lucky find; please report it.
+A hit that fails is printed with `[UNVERIFIED: the CPU does not agree this hit follows from its inputs]` and the process exits non-zero. That is a correctness bug, not a lucky find; please report it.
 
 `--no-verify` turns it off. There is rarely a reason.
+
+### What the re-derivation cannot say on its own
+
+Both the salt and the address in a result slot come from the device, so comparing them establishes that the pair is self-consistent rather than that either is what the run asked for. In create2 and create3 that is the whole story, because the salt *is* the result: one that derives the address printed beside it is usable whatever produced it.
+
+1nft is the exception, and it gets a second check. There the result is a magic, and the deployer rebuilds the salt around it from the account, so a salt whose low 16 bytes are not `keccak256(--mint-for)[16:32]` still derives a real address and still reports a magic — one that mints a different address than the one displayed. `SaltConfig::salt_binds_to_mint_for` reconstructs what the deployer would build, through the same `nft_salt` the mode is written in, and a hit that fails it is marked unverified like any other.
+
+That one is **not** disabled by `--no-verify`. The flag exists to skip the per-hit re-derivation; the binding is a single keccak of 20 bytes, and a magic that cannot mint is malformed rather than merely unchecked. No honest device can trip it: the work-item words span salt bytes 3 to 14, so the pinned half comes back as it was sent. It is there for the salts that do not come from honest hardware, which on a rented machine is not a hypothetical — see [vastai.md](vastai.md).
 
 ## `1miner self-test`
 
@@ -53,6 +61,8 @@ That check is the whole safety net for one class of bug, because the two backend
 **Keccak variant equivalence.** Both permutations must find the same address for the same work item.
 
 **1nft salt layout.** The reported magic plus the caller must rebuild exactly the salt that was mined, and the low 16 bytes must be the pinned caller digest.
+
+**1nft account binding on the return path.** A result slot holding a salt with an unpinned low half, together with the address that salt really derives, has to come back unverified — with `--no-verify` as well, since the flag does not reach this check. The same slot built honestly has to come back verified, because a check that rejects a real hit costs a search.
 
 GPU-dependent tests skip rather than fail when no device is present, so the suite still runs in CI and inside a container.
 

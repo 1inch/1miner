@@ -55,14 +55,16 @@ impl Reporter for TerminalReporter {
                 .unwrap_or_default(),
         };
 
-        // A hit that fails re-derivation means the kernel and the CPU disagree,
-        // which is a correctness bug rather than a lucky find. Say so loudly
-        // instead of printing it like any other result.
+        // Two things can fail here and the marker covers both, because what the
+        // operator does about either is the same. Either the kernel and the CPU
+        // disagree about the address, which is a correctness bug; or the device
+        // returned a 1nft salt not bound to --mint-for, which an honest one
+        // cannot do. Say so loudly instead of printing it like any other result.
         let flag = if hit.verified {
             String::new()
         } else {
             self.unverified += 1;
-            "  [UNVERIFIED: CPU re-derivation disagrees with the kernel]".to_string()
+            "  [UNVERIFIED: the CPU does not agree this hit follows from its inputs]".to_string()
         };
 
         // Under --exact every match scores the same, so the score says nothing

@@ -45,7 +45,7 @@ Every mode guide ends with how to turn the result into a deployed contract or a 
 
 `profanity` mode never accepts a private key. You generate a keypair offline, pass only the public key, and the miner reports an **offset**. Adding that offset to your seed private key gives the private key for the found address, so the search itself can run on a machine you do not control. `scripts/profanity-keygen.sh` makes the keypair and `scripts/profanity-final-key.sh` does the addition, checking the result against the address that was mined. See [docs/modes/profanity.md](docs/modes/profanity.md).
 
-Every reported hit is re-derived on the CPU before it is printed. If the kernel and the reference ever disagree, the hit is flagged and the process exits non-zero rather than handing you an address that does not exist. Disable with `--no-verify` only if you have a reason to.
+Every reported hit is re-derived on the CPU before it is printed. If the kernel and the reference ever disagree, the hit is flagged and the process exits non-zero rather than handing you an address that does not exist. Disable with `--no-verify` only if you have a reason to. In `1nft` the reported magic is additionally rebuilt against `--mint-for`, so a device cannot name an address its magic would not mint; that one is not disabled by the flag.
 
 No mode ever assumes a deployer address. A salt mined against the wrong deployer produces an address that looks perfectly valid and is unusable, so `--deployer` is always required outside `--benchmark`.
 
