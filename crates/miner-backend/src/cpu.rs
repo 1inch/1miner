@@ -138,9 +138,25 @@ impl CpuBackend {
                                     offset: None,
                                     pattern,
                                     device_index: 0,
-                                    // Derived on the CPU to begin with, so
-                                    // there is nothing left to cross-check.
-                                    verified: true,
+                                    // Not the tautology it looks like. On
+                                    // aarch64 `derive_pair` returns
+                                    // `neon::addresses`, a two-lane SIMD
+                                    // permutation that is a separate
+                                    // implementation from the scalar one this
+                                    // compares against, and the CLI trusts this
+                                    // flag rather than re-deriving anything.
+                                    //
+                                    // Nothing diverges today, because
+                                    // `neon::state_for` builds its pre-image
+                                    // from the same `salt_at` that produced
+                                    // `salt`, so only the permutation differs
+                                    // and the agreement tests cover it. This is
+                                    // what keeps that true if the NEON path is
+                                    // ever changed to bump state words directly
+                                    // the way the kernels do.
+                                    verified: cfg.salt_binds_to_mint_for(&salt)
+                                        && (!job.verify
+                                            || cfg.address_for_salt(&salt) == addresses[lane]),
                                 };
                                 if job.is_exact() {
                                     // No bar to take, and every match is wanted.
