@@ -27,7 +27,10 @@
 #
 # The key is the only thing on stdout, so `key=$(scripts/profanity-final-key.sh
 # --offset 0x...)` works; everything else goes to stderr. Prefer $PROFANITY_PK
-# to an argument, which leaves a private key in the shell history.
+# to an argument. An argument leaves the key in the shell history, and in the
+# process list for as long as the run takes, where any other local user can read
+# it -- /proc/PID/cmdline on Linux, ps on macOS. The sums below go over a pipe
+# precisely to stay out of that list, so the entry point should not undo it.
 set -eu
 
 N=fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141
@@ -42,7 +45,9 @@ die() {
 }
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    # The comment block above, however long it grows, as bench.sh does it: the
+    # fixed line range this replaces went stale the moment a line was added.
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 OFFSET=""
