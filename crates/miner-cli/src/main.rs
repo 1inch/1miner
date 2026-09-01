@@ -146,8 +146,9 @@ fn mine(
     println!();
     if reporter.unverified > 0 {
         anyhow::bail!(
-            "{} of {} reported hits failed CPU re-derivation; treat the results as unsafe \
-             and report this, since it means the kernel and the reference disagree",
+            "{} of {} reported hits do not follow from the inputs; discard them and report \
+             this, since it means either that the kernel and the reference disagree or that \
+             the device returned a salt this search could not have mined",
             reporter.unverified,
             reporter.hits
         );

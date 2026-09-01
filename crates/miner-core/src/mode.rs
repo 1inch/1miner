@@ -6,7 +6,7 @@
 
 use crate::{
     Address, CoreError, Hash, Result, Salt,
-    address::{create_address, create2_address, create2_preimage, create3_address},
+    address::{create_address, create2_address, create2_preimage, create3_address, nft_salt},
     keccak256,
     secp256k1::{Point, address_for_offset},
 };
@@ -187,6 +187,25 @@ impl SaltConfig {
     pub fn magic_at(&self, device_index: u32, global_id: u32, round: u32) -> Option<[u8; 16]> {
         self.magic_of(&self.salt_at(device_index, global_id, round))
     }
+
+    /// Whether a salt a device handed back is one this job could have mined.
+    ///
+    /// The 1nft deployer never takes a salt. It rebuilds one from the magic and
+    /// the account, so a magic is usable only where the low half is the pinned
+    /// digest. A salt with any other low half derives a real address from a
+    /// real salt — which is all `address_for_salt` can attest — and reports a
+    /// magic that mints somewhere else entirely.
+    ///
+    /// Honest hardware cannot produce one: the work-item words span salt bytes
+    /// 3 to 14, so the low half comes back as [`SaltConfig::new`] pinned it.
+    /// This is here for the salts that do not come from honest hardware.
+    pub fn salt_binds_to_mint_for(&self, salt: &Salt) -> bool {
+        let Some(account) = self.mint_for else {
+            return true;
+        };
+        self.magic_of(salt)
+            .is_some_and(|magic| nft_salt(&magic, &account) == *salt)
+    }
 }
 
 /// Profanity mode inputs. Only a public key is ever accepted, so the miner
@@ -308,6 +327,40 @@ mod tests {
         assert_eq!(&salt[..16], &magic);
         // The magic plus the caller reconstructs the full salt the deployer uses.
         assert_eq!(crate::address::nft_salt(&magic, &caller), salt);
+    }
+
+    /// The property `salt_binds_to_mint_for` exists to state: a salt is only
+    /// mineable by this job when the deployer would rebuild it from the magic
+    /// it reports. Every work item satisfies it, and a low half that came from
+    /// anywhere else does not.
+    #[test]
+    fn nft_rejects_a_salt_the_deployer_would_not_rebuild() {
+        let caller = parse_address("0x00000000219ab540356cbb839cbe05303d7705fa").unwrap();
+        let cfg = salt_cfg(MineMode::Nft, Some(caller));
+
+        let salt = cfg.salt_at(3, 5, 2);
+        assert!(cfg.salt_binds_to_mint_for(&salt));
+
+        // One bit of the pinned half is the whole difference between a magic
+        // that mints the address reported with it and one that does not.
+        let mut tampered = salt;
+        tampered[31] ^= 1;
+        assert!(!cfg.salt_binds_to_mint_for(&tampered));
+
+        // The high half is the part being searched, so moving it is ordinary.
+        let mut other_magic = salt;
+        other_magic[0] ^= 0xff;
+        assert!(cfg.salt_binds_to_mint_for(&other_magic));
+    }
+
+    /// The other salt modes report the salt itself, so there is nothing to
+    /// bind and any salt is one they could have mined.
+    #[test]
+    fn modes_without_a_caller_bind_nothing() {
+        for mode in [MineMode::Create2, MineMode::Create3] {
+            let cfg = salt_cfg(mode, None);
+            assert!(cfg.salt_binds_to_mint_for(&[0xABu8; 32]));
+        }
     }
 
     #[test]

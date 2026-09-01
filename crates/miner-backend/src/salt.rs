@@ -7,6 +7,15 @@
 //! The address reported would be a real one, just not the one that salt
 //! produces, and the user would deploy to somewhere else entirely.
 //!
+//! Both halves of that comparison arrive from the device, so it attests that
+//! the pair is self-consistent rather than that either is what was asked for.
+//! In 1nft, where the reportable result is a magic and the deployer rebuilds
+//! the salt around it, that is not enough on its own: a salt whose low half is
+//! not the pinned account digest passes it and still names an address the
+//! magic cannot mint. `SaltConfig::salt_binds_to_mint_for` is the other half of
+//! the check, and unlike the re-derivation it is not something `--no-verify`
+//! turns off.
+//!
 //! The slot layout and the two ways of reading a round out of it live here for
 //! the reason [`crate::profanity`] gives for the same split: a backend that
 //! reads the layout subtly wrong reports another work item's salt, and two
@@ -48,7 +57,8 @@ impl SaltRound<'_> {
             offset: None,
             pattern,
             device_index: self.device_index,
-            verified: !self.job.verify || self.cfg.address_for_salt(&salt) == slot.hash,
+            verified: self.cfg.salt_binds_to_mint_for(&salt)
+                && (!self.job.verify || self.cfg.address_for_salt(&salt) == slot.hash),
         }
     }
 
@@ -304,5 +314,91 @@ mod tests {
                 _ => assert!(hit.magic.is_none()),
             }
         }
+    }
+
+    /// A 1nft config whose deployer and account are the ones the report used,
+    /// so the addresses below are the report's own.
+    fn nft_config() -> SaltConfig {
+        SaltConfig::new(
+            MineMode::Nft,
+            parse_address("0x1111111111111111111111111111111111111111").unwrap(),
+            DEFAULT_PROXY_CODE_HASH,
+            [7u8; 32],
+            Some(parse_address("0x00000000219ab540356cbb839cbe05303d7705fa").unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// The salt a hostile device would send: an arbitrary low half, and the
+    /// address that salt genuinely derives, so the two agree with each other.
+    fn unbound_slot(cfg: &SaltConfig) -> SaltSlot {
+        let mut salt = [b'A'; 32];
+        salt[..16].copy_from_slice(&hex::decode("deadbeefdeadbeefdeadbeefdeadbeef").unwrap());
+        SaltSlot {
+            salt,
+            hash: cfg.address_for_salt(&salt),
+            found: 1,
+        }
+    }
+
+    /// Reported by Kvazar: a device can pick the half of the salt that 1nft
+    /// pins, and the address check alone accepts it, because both sides of that
+    /// comparison come from the device. What is printed is then a magic that
+    /// mints an address other than the one beside it.
+    #[test]
+    fn nft_rejects_a_salt_not_bound_to_the_account() {
+        let cfg = nft_config();
+        let job = job(&cfg, None);
+
+        let mut slots = vec![SaltSlot::default(); RESULT_SLOTS];
+        slots[9] = unbound_slot(&cfg);
+
+        let (_, hit) = round(&cfg, &job)
+            .take_best(&slots, 0)
+            .expect("an occupied slot");
+
+        assert!(!hit.verified);
+
+        // Why it has to be rejected: the salt does derive the address reported,
+        // so nothing else in the pipeline would notice, and the magic mints
+        // somewhere else.
+        let magic = hit.magic.expect("1nft reports a magic");
+        let account = cfg.mint_for.unwrap();
+        assert_eq!(cfg.address_for_salt(&hit.salt.unwrap()), hit.address);
+        assert_ne!(
+            cfg.address_for_salt(&miner_core::nft_salt(&magic, &account)),
+            hit.address
+        );
+    }
+
+    /// `--no-verify` trades the per-hit re-derivation for speed. The binding is
+    /// not that trade: it is a single keccak of 20 bytes, and a magic that
+    /// cannot mint is malformed rather than merely unchecked.
+    #[test]
+    fn the_account_binding_survives_no_verify() {
+        let cfg = nft_config();
+        let mut job = job(&cfg, None);
+        job.verify = false;
+
+        let mut slots = vec![SaltSlot::default(); RESULT_SLOTS];
+        slots[9] = unbound_slot(&cfg);
+
+        let (_, hit) = round(&cfg, &job)
+            .take_best(&slots, 0)
+            .expect("an occupied slot");
+        assert!(!hit.verified);
+
+        // And it still passes everything an honest device sends, which is the
+        // half of this that a check rejecting too much would fail.
+        let honest = cfg.salt_at(0, 1, 1);
+        slots[9] = SaltSlot {
+            salt: honest,
+            hash: cfg.address_for_salt(&honest),
+            found: 1,
+        };
+        let (_, hit) = round(&cfg, &job)
+            .take_best(&slots, 0)
+            .expect("an occupied slot");
+        assert!(hit.verified);
     }
 }

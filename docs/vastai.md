@@ -10,7 +10,9 @@ The image is published as `ghcr.io/1inch/1miner` (see [Building and pushing the 
 
 In `profanity` mode 1miner never sees your private key. You pass a *public* key with `--public-key`, and what it prints is an **offset** that is worthless without the seed private key that stays on your machine; the two are added together locally afterwards. See [modes/profanity.md](modes/profanity.md). That is what makes renting GPU time from strangers acceptable.
 
-The salt modes never involve a key at all. The worst a hostile host could do is report a salt that does not produce the address it claims, and `--verify` (on by default) re-derives every hit on the CPU before printing it, so that fails loudly rather than silently.
+The salt modes never involve a key at all. The worst a hostile host could do is report a result that does not produce the address it claims, and `--verify` (on by default) re-derives every hit on the CPU before printing it, so that fails loudly rather than silently.
+
+In `1nft` that takes a second check, because the result reported there is a magic rather than a salt and the deployer rebuilds the salt around it. A device could otherwise return a salt whose low half is not the account's, which derives a real address and reports a magic that mints a different one — so the magic is also rebuilt from `--mint-for` and compared, and unlike the re-derivation that check is not something `--no-verify` switches off. This gap was real until 0.2.1; on an older binary, check a magic against the contract before minting, as [modes/1nft.md](modes/1nft.md) describes.
 
 ## Quick start on vast.ai
 
@@ -326,7 +328,7 @@ Whichever registry you use, its full name goes into the *Image Path:Tag* field o
 
 **`self-test` prints `FAIL`** — do not mine on this instance. The GPU is deriving different addresses from the CPU reference, so any result would be wrong in a way that looks right. Destroy it and rent another. If it reproduces across several hosts, that is a bug in 1miner rather than the rental; please report it with the GPU and driver version.
 
-**A hit is printed with `[UNVERIFIED: CPU re-derivation disagrees with the kernel]`** — same situation, caught mid-run. The process exits non-zero on purpose. See [correctness.md](correctness.md).
+**A hit is printed with `[UNVERIFIED: the CPU does not agree this hit follows from its inputs]`** — same situation, caught mid-run. The process exits non-zero on purpose. In `1nft` it can also mean the host returned a salt that was not the one mined for your account, which no honest device does. See [correctness.md](correctness.md).
 
 **The instance stays in `loading` and never runs** — the image could not be pulled. A GHCR package is private until you say otherwise, and a ttl.sh image is gone once the lifetime in its tag has passed. Check `status_msg` in `vastai show instance <id> --raw`.
 

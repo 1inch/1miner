@@ -24,9 +24,11 @@ Compiled OpenCL binaries are cached, keyed on source, build options and device n
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/1miner/opencl"
 ```
 
-## `[UNVERIFIED: CPU re-derivation disagrees with the kernel]`
+## `[UNVERIFIED: the CPU does not agree this hit follows from its inputs]`
 
 The GPU reported an address that the CPU cannot reproduce from the reported salt or offset. This is a correctness bug, not a near miss: the result is not usable. The process exits non-zero deliberately.
+
+In `1nft` the same marker has a second cause: the device returned a salt whose low 16 bytes are not the `--mint-for` digest, so the magic beside it would mint a different address. An honest device cannot do that, since it never varies that half of the salt. On your own hardware, treat it as the bug above; on a machine you rented, treat the host as hostile and destroy the instance.
 
 Please report it with the backend, kernel variant, GPU and driver version. Then narrow it down:
 
