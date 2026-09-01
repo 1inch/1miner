@@ -362,9 +362,11 @@ impl Rounds<'_> {
             let total = unsafe { read_counter(flags) };
             context.drain_exact(&slots, total)
         } else {
+            // The bar to adopt, which for a hit the CPU could not confirm is
+            // the one already in force. See `RoundContext::take_best`.
             match context.take_best(&slots, *best) {
-                Some((score, hit)) => {
-                    *best = u64::from(score);
+                Some((bar, hit)) => {
+                    *best = u64::from(bar);
                     vec![Progress::Hit(hit)]
                 }
                 None => Vec::new(),

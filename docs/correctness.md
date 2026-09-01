@@ -16,7 +16,11 @@ A hit that fails is printed with `[UNVERIFIED: the CPU does not agree this hit f
 
 ### What the re-derivation cannot say on its own
 
-Both the salt and the address in a result slot come from the device, so comparing them establishes that the pair is self-consistent rather than that either is what the run asked for. In create2 and create3 that is the whole story, because the salt *is* the result: one that derives the address printed beside it is usable whatever produced it.
+Both the salt and the address in a result slot come from the device, so comparing them establishes that the pair is self-consistent rather than that either is what the run asked for. In create2 and create3 the reported hit needs nothing further, because the salt *is* the result: one that derives the address printed beside it is usable whatever produced it.
+
+What a self-consistent pair says nothing about is the score, and the score is not part of the result — it is the bar. Slots are indexed by score, so the slot a device writes into is its own account of what it found, and that number is published into an atomic every device reads back as `scoreMax`. Put a genuinely derived pair in a slot far above what the search is reaching and the bar rises for the whole rig, after which every later hit fails the kernel's own test and is never written: a rig that mines and reports nothing. So the reported address is scored again on the host, and a hit whose slot index disagrees comes back unverified and does not move the bar. Like the 1nft binding below, that check runs whatever `--no-verify` says, because it is a pass over 20 bytes rather than the per-hit re-derivation the flag exists to skip. profanity uses the same slot layout and gets the same treatment.
+
+Withholding the bar is not specific to a wrong score. No hit the CPU failed to confirm raises it, for a reason that only shows up on a long run: the process bails on an unverified hit when the run ends, so one arriving in the first minute would otherwise have suppressed the following ten hours.
 
 1nft is the exception, and it gets a second check. There the result is a magic, and the deployer rebuilds the salt around it from the account, so a salt whose low 16 bytes are not `keccak256(--mint-for)[16:32]` still derives a real address and still reports a magic — one that mints a different address than the one displayed. `SaltConfig::salt_binds_to_mint_for` reconstructs what the deployer would build, through the same `nft_salt` the mode is written in, and a hit that fails it is marked unverified like any other.
 
@@ -63,6 +67,8 @@ That check is the whole safety net for one class of bug, because the two backend
 **1nft salt layout.** The reported magic plus the caller must rebuild exactly the salt that was mined, and the low 16 bytes must be the pinned caller digest.
 
 **1nft account binding on the return path.** A result slot holding a salt with an unpinned low half, together with the address that salt really derives, has to come back unverified — with `--no-verify` as well, since the flag does not reach this check. The same slot built honestly has to come back verified, because a check that rejects a real hit costs a search.
+
+**A device-chosen score on the return path.** A genuinely derived hit, planted in a slot index its address does not earn, has to come back unverified and leave the shared bar where it was, with `--no-verify` as well. Asserted for the salt slots and the profanity ones, which carry the same layout, and paired with the honest slot each time so that a check rejecting everything could not pass. A hit failing any other check has to withhold the bar too, which is asserted separately, since the two reasons take different routes to the same flag.
 
 GPU-dependent tests skip rather than fail when no device is present, so the suite still runs in CI and inside a container.
 
