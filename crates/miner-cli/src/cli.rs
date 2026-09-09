@@ -298,6 +298,27 @@ pub struct Scoring {
     pub exact: Option<Vec<(String, ScoreSpec)>>,
 }
 
+/// Reject a scoring mask that no address could ever score against.
+///
+/// `nibble_mask` reads anything that is not a hex digit as a wildcard, so a
+/// pattern holding none at all — `0x`, an unset shell variable, a typo — builds
+/// an all-zero mask. `score` credits a byte only where the mask byte is
+/// non-zero and every kernel filters score 0, so such a run mines at full
+/// speed, reports nothing and exits 0 for as long as it is left to.
+///
+/// `--exact` rejects the same patterns through its own check, and says
+/// something different: there an unconstrained mask matches every address
+/// rather than none.
+fn scoring_mask(flag: &str, pattern: &str, spec: ScoreSpec) -> anyhow::Result<ScoreSpec> {
+    if spec.constrained_bytes() == 0 {
+        anyhow::bail!(
+            "{flag} needs at least one hex digit to match against, and {pattern:?} has none, \
+             so no address could ever score"
+        );
+    }
+    Ok(spec)
+}
+
 impl ScoringArgs {
     /// Every `--exact` mask, from whichever of the two forms was used.
     fn exact_masks(&self) -> anyhow::Result<Vec<(String, ScoreSpec)>> {
@@ -370,10 +391,12 @@ impl ScoringArgs {
             chosen.push(("--leading", ScoreSpec::leading(c)?));
         }
         if let Some(p) = &self.matching {
-            chosen.push(("--matching", ScoreSpec::matching(p)?));
+            let spec = scoring_mask("--matching", p, ScoreSpec::matching(p)?)?;
+            chosen.push(("--matching", spec));
         }
         if let Some(p) = &self.trailing {
-            chosen.push(("--trailing", ScoreSpec::trailing(p)?));
+            let spec = scoring_mask("--trailing", p, ScoreSpec::trailing(p)?)?;
+            chosen.push(("--trailing", spec));
         }
         // However many masks were given, they are one choice of what to search
         // for. The first stands in as the job's nominal spec; the exact kernels
@@ -659,6 +682,67 @@ mod tests {
                 .to_string()
                 .contains("give only one of")
         );
+    }
+
+    /// A mask holding no hex digit scores zero on every address, so the run
+    /// reports nothing however long it is left to. `--exact` rejected these
+    /// strings from the start; the two scoring flags accepted them.
+    #[test]
+    fn a_mask_that_can_never_score_is_rejected() {
+        // The empty string is here because it is the one an operator reaches by
+        // accident: `--matching "$PATTERN"` with the variable unset, or the
+        // container's MINER_ARGS built the same way.
+        for pattern in ["0x", "XXXX", "ghij", "....", ""] {
+            let matching = ScoringArgs {
+                matching: Some(pattern.into()),
+                ..Default::default()
+            };
+            let err = matching.resolve().unwrap_err().to_string();
+            assert!(
+                err.contains("--matching") && err.contains("hex digit"),
+                "{pattern:?}: {err}"
+            );
+
+            let trailing = ScoringArgs {
+                trailing: Some(pattern.into()),
+                ..Default::default()
+            };
+            let err = trailing.resolve().unwrap_err().to_string();
+            assert!(
+                err.contains("--trailing") && err.contains("hex digit"),
+                "{pattern:?}: {err}"
+            );
+        }
+    }
+
+    /// The guard counts hex digits rather than characters, so a mask that is
+    /// mostly wildcards still resolves. Odd-length `--trailing` patterns matter
+    /// most: `mask` pads them with a leading wildcard nibble, and a guard
+    /// counting characters would reject the ones that pad to a whole byte.
+    #[test]
+    fn a_partly_wildcarded_mask_still_resolves() {
+        for pattern in ["d.a.d", "XXXXcafe", "de..beef", "a"] {
+            let matching = ScoringArgs {
+                matching: Some(pattern.into()),
+                ..Default::default()
+            };
+            assert!(matching.resolve().is_ok(), "--matching {pattern:?}");
+
+            let trailing = ScoringArgs {
+                trailing: Some(pattern.into()),
+                ..Default::default()
+            };
+            assert!(trailing.resolve().is_ok(), "--trailing {pattern:?}");
+        }
+
+        // Odd lengths on the anchored side, where the pad is inserted.
+        for pattern in ["c", "abc", "X.X.a"] {
+            let trailing = ScoringArgs {
+                trailing: Some(pattern.into()),
+                ..Default::default()
+            };
+            assert!(trailing.resolve().is_ok(), "--trailing {pattern:?}");
+        }
     }
 
     #[test]
