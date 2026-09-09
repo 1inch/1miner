@@ -21,6 +21,11 @@
 #
 # Sets PROFANITY_PK, the 64-hex seed private key to keep, and PROFANITY_PUBKEY,
 # the 128-hex public key for `1miner profanity --public-key`.
+#
+# Both are exported, because profanity-final-key.sh reads the seed as a child
+# process. Everything else started from that shell inherits it too, which is one
+# more reason the pair is made on a machine you trust: only the public half is
+# ever handed to the miner, and on rented hardware that is all that exists.
 
 # Whether this file is sourced decides everything below, so it is settled first.
 # `set -e` in a sourced file applies to the shell that sourced it, which in an
