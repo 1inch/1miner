@@ -200,6 +200,13 @@ impl RoundContext<'_> {
 
     /// Result slots are indexed by score, so the best hit is the highest
     /// occupied slot above what has already been reported.
+    ///
+    /// The slot index is the device's own account of the score, and it is
+    /// checked here against the host's scorer for the reason
+    /// [`crate::salt::SaltRound::take_best`] gives at length: the value is
+    /// published into a bar every device reads back, so an inflated one costs
+    /// the rest of the search. The `u32` handed back is the bar to adopt, which
+    /// for a hit that failed a check is the threshold unchanged.
     pub fn take_best(&self, results: &[ResultSlot], threshold: u64) -> Option<(u32, Hit)> {
         for score in (1..=MAX_SCORE).rev() {
             if results[score].found == 0 {
@@ -208,10 +215,14 @@ impl RoundContext<'_> {
             if score as u64 <= threshold {
                 break;
             }
-            return Some((
-                score as u32,
-                self.hit_from(&results[score], score as u32, None),
-            ));
+            let mut hit = self.hit_from(&results[score], score as u32, None);
+            hit.verified &= miner_core::score(&self.job.score, &hit.address) == score as u32;
+            let bar = if hit.verified {
+                score as u32
+            } else {
+                threshold as u32
+            };
+            return Some((bar, hit));
         }
         None
     }
@@ -357,6 +368,79 @@ mod tests {
         assert_eq!(size_of::<MpPoint>(), 64);
         assert_eq!(size_of::<ResultSlot>(), 28);
         assert_eq!(align_of::<MpNumber>(), 16);
+    }
+
+    /// The generator as the seed public key: its private half is 1, so a
+    /// failing case here can be reproduced by hand.
+    fn profanity_config() -> ProfanityConfig {
+        ProfanityConfig {
+            seed_public_key: miner_core::secp256k1::generator(),
+            contract: false,
+        }
+    }
+
+    fn profanity_job(score: ScoreSpec) -> Job {
+        Job {
+            mode: miner_core::ModeConfig::Profanity(profanity_config()),
+            score,
+            keccak: crate::KeccakVariant::Tuned,
+            tuning: crate::Tuning::default(),
+            duration: None,
+            verify: true,
+            exact: None,
+        }
+    }
+
+    /// The same defect [`crate::salt`] carries a test for, in the mode the
+    /// report did not mention: a slot is indexed by score here too, so a device
+    /// can walk to a real address, name the offset that really reaches it, and
+    /// still choose what the run believes that address is worth.
+    #[test]
+    fn a_score_the_address_did_not_earn_is_rejected() {
+        let cfg = profanity_config();
+        let seed = Ulong4([5, 0, 0, 0]);
+        let (round, found_id) = (7u64, 3u32);
+
+        // A slot an honest kernel would write: the address the reported offset
+        // genuinely reaches, so the re-derivation has something true to agree
+        // with and only the slot index is in question.
+        let offset = offset_scalar(&seed, round, found_id);
+        let address = cfg
+            .address_for_offset(&offset)
+            .expect("the walk reaches an address");
+        let slot = ResultSlot {
+            found: 1,
+            found_id,
+            found_hash: address,
+        };
+
+        let job = profanity_job(ScoreSpec::matching(&hex::encode(&address[..3])).unwrap());
+        let context = || RoundContext {
+            cfg: &cfg,
+            job: &job,
+            device_index: 0,
+            seed: &seed,
+            round,
+        };
+
+        let mut earned = vec![ResultSlot::default(); crate::RESULT_SLOTS];
+        earned[3] = slot;
+        let (bar, hit) = context().take_best(&earned, 0).expect("an occupied slot");
+        assert!(hit.verified);
+        assert_eq!((bar, hit.score), (3, 3));
+
+        let mut planted = vec![ResultSlot::default(); crate::RESULT_SLOTS];
+        planted[MAX_SCORE] = slot;
+        let (bar, hit) = context().take_best(&planted, 0).expect("an occupied slot");
+        assert!(!hit.verified);
+        assert_eq!(bar, 0);
+
+        // The offset really does name the address printed beside it, so the
+        // re-derivation alone would have passed this.
+        assert_eq!(
+            cfg.address_for_offset(&hit.offset.unwrap()),
+            Some(hit.address)
+        );
     }
 
     /// The kernels index the table as `[byte_index * 255 + (value - 1)]`, so

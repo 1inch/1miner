@@ -283,6 +283,12 @@ pub fn drain_hits(
 /// still the bar when the hit is queued. A caller examining candidates one at
 /// a time should test the bar again without the lock first, so that only a
 /// candidate which already looks like a hit pays for taking it.
+///
+/// The `u32` it returns is the bar to adopt rather than the hit's score. The
+/// two are the same for a hit that verified, and for one that did not
+/// `take_best` hands back the bar unchanged: the value goes into an atomic
+/// every device reads as `scoreMax`, so a hit the CPU could not confirm must
+/// not be able to stop the rest of the run reporting.
 pub fn queue_best(
     queue: &std::sync::Mutex<Vec<Progress>>,
     best: &std::sync::atomic::AtomicU64,

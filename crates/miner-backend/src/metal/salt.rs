@@ -217,9 +217,11 @@ fn retire(
         let total = unsafe { read_counter(flags) };
         reader.drain_exact(&slots, total)
     } else {
+        // The bar to adopt, which for a hit the CPU could not confirm is the
+        // one already in force. See `SaltRound::take_best`.
         match reader.take_best(&slots, u64::from(*best)) {
-            Some((score, hit)) => {
-                *best = score;
+            Some((bar, hit)) => {
+                *best = bar;
                 vec![Progress::Hit(hit)]
             }
             None => Vec::new(),

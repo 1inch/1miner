@@ -16,6 +16,13 @@
 //! the check, and unlike the re-derivation it is not something `--no-verify`
 //! turns off.
 //!
+//! The score is a third thing the device chooses, and the slot it writes into
+//! is how it says so. That one is not part of the result: it is the bar every
+//! device in the run reads back, so an inflated one costs the rest of the
+//! search rather than the hit. [`SaltRound::take_best`] scores the reported
+//! address on the host, and a hit whose slot disagrees is reported without
+//! raising the bar.
+//!
 //! The slot layout and the two ways of reading a round out of it live here for
 //! the reason [`crate::profanity`] gives for the same split: a backend that
 //! reads the layout subtly wrong reports another work item's salt, and two
@@ -64,6 +71,20 @@ impl SaltRound<'_> {
 
     /// Result slots are indexed by score, so the best hit is the highest
     /// occupied slot above what has already been reported.
+    ///
+    /// Which slot a hit arrived in is the device's choice, so it is checked the
+    /// way the address is. `hit_from` re-derives the address from the salt;
+    /// this scores that address to see whether it belongs in the slot it came
+    /// back in. Both are needed: a device can plant a genuinely derived pair in
+    /// a slot far above what the search is reaching, and the pair alone attests
+    /// nothing about the number beside it.
+    ///
+    /// The `u32` handed back is the bar to adopt rather than the hit's score.
+    /// They differ for a hit that failed a check, which leaves the bar where it
+    /// was — the score is published into an atomic every device reads back as
+    /// `scoreMax`, so one inflated value stops every kernel in the run writing
+    /// results the host would have reported. The hit is still returned, because
+    /// a slot dropped in silence is the failure this path exists to prevent.
     pub fn take_best(&self, results: &[SaltSlot], threshold: u64) -> Option<(u32, Hit)> {
         for score in (1..=MAX_SCORE).rev() {
             if results[score].found == 0 {
@@ -72,10 +93,18 @@ impl SaltRound<'_> {
             if score as u64 <= threshold {
                 break;
             }
-            return Some((
-                score as u32,
-                self.hit_from(&results[score], score as u32, None),
-            ));
+            let mut hit = self.hit_from(&results[score], score as u32, None);
+            // Whatever --verify says, for the reason salt_binds_to_mint_for is:
+            // a pass over 20 bytes rather than the per-hit re-derivation the
+            // flag exists to skip, and a device that names its own score is
+            // sending something malformed rather than merely unchecked.
+            hit.verified &= miner_core::score(&self.job.score, &hit.address) == score as u32;
+            let bar = if hit.verified {
+                score as u32
+            } else {
+                threshold as u32
+            };
+            return Some((bar, hit));
         }
         None
     }
@@ -165,6 +194,23 @@ mod tests {
         slots
     }
 
+    /// The address every planted slot here carries.
+    fn planted(cfg: &SaltConfig) -> Address {
+        cfg.address_for_salt(&cfg.salt_at(0, 1, 1))
+    }
+
+    /// A specification `address` genuinely scores `score` against: a mask over
+    /// its own first `score` bytes, which the matching scorer credits one byte
+    /// at a time.
+    ///
+    /// `take_best` checks the slot a hit arrived in against this scorer, so a
+    /// test planting a slot has to agree with it. Left to a spec the address
+    /// scores nothing against, every one of these would exercise the rejection
+    /// path while appearing to test the ordinary one.
+    fn scoring(address: &Address, score: usize) -> ScoreSpec {
+        ScoreSpec::matching(&hex::encode(&address[..score])).unwrap()
+    }
+
     fn hits(found: &[Progress]) -> Vec<&Hit> {
         found
             .iter()
@@ -189,12 +235,13 @@ mod tests {
     #[test]
     fn the_best_slot_above_the_bar_is_the_one_reported() {
         let cfg = config();
-        let job = job(&cfg, None);
+        let mut job = job(&cfg, None);
+        job.score = scoring(&planted(&cfg), 9);
 
-        let (score, hit) = round(&cfg, &job)
+        let (bar, hit) = round(&cfg, &job)
             .take_best(&results(9, &cfg), 0)
             .expect("an occupied slot above the bar");
-        assert_eq!((score, hit.score), (9, 9));
+        assert_eq!((bar, hit.score), (9, 9));
         assert!(hit.verified);
     }
 
@@ -303,7 +350,8 @@ mod tests {
         ] {
             let cfg = SaltConfig::new(mode, deployer, DEFAULT_PROXY_CODE_HASH, [7u8; 32], mint_for)
                 .unwrap();
-            let job = job(&cfg, None);
+            let mut job = job(&cfg, None);
+            job.score = scoring(&planted(&cfg), 4);
             let (_, hit) = round(&cfg, &job)
                 .take_best(&results(4, &cfg), 0)
                 .expect("an occupied slot");
@@ -396,9 +444,94 @@ mod tests {
             hash: cfg.address_for_salt(&honest),
             found: 1,
         };
+        job.score = scoring(&cfg.address_for_salt(&honest), 9);
         let (_, hit) = round(&cfg, &job)
             .take_best(&slots, 0)
             .expect("an occupied slot");
         assert!(hit.verified);
+    }
+
+    /// Reported by Kvazar: a result slot is indexed by score, so a device that
+    /// puts a genuinely derived pair in a slot the search is nowhere near names
+    /// its own score. Every device reads that value back as `scoreMax`, so it
+    /// used to stop the whole run reporting anything further.
+    #[test]
+    fn a_score_the_address_did_not_earn_is_rejected() {
+        let cfg = config();
+        let mut job = job(&cfg, None);
+        job.score = scoring(&planted(&cfg), 3);
+
+        // Three is what this address earns, and it is reported as ever.
+        let (bar, hit) = round(&cfg, &job)
+            .take_best(&results(3, &cfg), 0)
+            .expect("an occupied slot");
+        assert!(hit.verified);
+        assert_eq!((bar, hit.score), (3, 3));
+
+        // The same salt and the same address, moved to a slot they did not
+        // earn. Reported, so the operator sees it and the run ends non-zero,
+        // rather than dropped in a silence indistinguishable from bad luck.
+        let (bar, hit) = round(&cfg, &job)
+            .take_best(&results(MAX_SCORE, &cfg), 0)
+            .expect("an occupied slot");
+        assert!(!hit.verified);
+        // The bar does not move, which is the part that cost the run.
+        assert_eq!(bar, 0);
+
+        // Nothing else in the pipeline would have caught it: the salt really
+        // does derive the address printed beside it.
+        assert_eq!(cfg.address_for_salt(&hit.salt.unwrap()), hit.address);
+
+        // A bar already in force stays where it is, rather than being reset.
+        let (bar, _) = round(&cfg, &job)
+            .take_best(&results(MAX_SCORE, &cfg), 2)
+            .expect("an occupied slot");
+        assert_eq!(bar, 2);
+    }
+
+    /// The bar is withheld from any hit the CPU could not confirm, not only
+    /// from one whose score was wrong. A run bails only once it ends, so an
+    /// unverified hit in its first minute used to suppress every later one.
+    #[test]
+    fn an_unverified_hit_does_not_raise_the_bar_either() {
+        let cfg = config();
+        let mut job = job(&cfg, None);
+        job.score = scoring(&planted(&cfg), 3);
+
+        // An address that is not the one its salt derives. The low byte is
+        // outside the three the mask constrains, so the score still agrees and
+        // the re-derivation is the only thing failing.
+        let mut slots = results(3, &cfg);
+        slots[3].hash[19] ^= 1;
+
+        let (bar, hit) = round(&cfg, &job)
+            .take_best(&slots, 0)
+            .expect("an occupied slot");
+        assert!(!hit.verified);
+        assert_eq!(bar, 0);
+    }
+
+    /// `--no-verify` skips the per-hit re-derivation. It does not buy a device
+    /// the right to choose the bar, any more than it does the 1nft binding.
+    #[test]
+    fn the_score_check_survives_no_verify() {
+        let cfg = config();
+        let mut job = job(&cfg, None);
+        job.verify = false;
+        job.score = scoring(&planted(&cfg), 3);
+
+        let (bar, hit) = round(&cfg, &job)
+            .take_best(&results(MAX_SCORE, &cfg), 0)
+            .expect("an occupied slot");
+        assert!(!hit.verified);
+        assert_eq!(bar, 0);
+
+        // And an honest slot still comes back verified, since a check that
+        // rejects real hits costs the search it was meant to protect.
+        let (bar, hit) = round(&cfg, &job)
+            .take_best(&results(3, &cfg), 0)
+            .expect("an occupied slot");
+        assert!(hit.verified);
+        assert_eq!(bar, 3);
     }
 }
