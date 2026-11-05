@@ -5,7 +5,8 @@
 # ---------------------------------------------------------------------------
 FROM rust:1-bookworm AS build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=0 update && apt-get -o Acquire::Retries=0 install -y --only-upgrade apt \
+    && apt-get install -y --no-install-recommends \
         opencl-headers \
         ocl-icd-opencl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -43,7 +44,8 @@ LABEL org.opencontainers.image.title="1miner" \
 
 # ocl-icd-libopencl1 is the ICD loader the binary links against; clinfo earns
 # its place by making "no devices found" diagnosable on a rented machine.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=0 update && apt-get -o Acquire::Retries=0 install -y --only-upgrade apt \
+    && apt-get install -y --no-install-recommends \
         ocl-icd-libopencl1 \
         clinfo \
         ca-certificates \
